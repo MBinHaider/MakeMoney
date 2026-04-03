@@ -6,7 +6,7 @@ import sys
 from datetime import datetime, timezone
 
 from config import Config
-from utils.db import init_db
+from utils.db import init_db, get_connection
 from utils.logger import get_logger
 from modules.data_collector import DataCollector
 from modules.wallet_scanner import WalletScanner
@@ -122,6 +122,40 @@ class PolyBot:
                 log.error(f"Wallet monitor error: {e}")
                 await asyncio.sleep(5)
 
+    async def status_update_loop(self):
+        """Send status update to Telegram every 5 minutes."""
+        while self.running:
+            try:
+                await asyncio.sleep(300)  # 5 minutes
+                stats = self.risk_manager.get_status()
+
+                conn = get_connection(self.config.DB_PATH)
+                recent_signals = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM signals WHERE timestamp > datetime('now', '-5 minutes')"
+                ).fetchone()["cnt"]
+                tracked_count = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM tracked_wallets"
+                ).fetchone()["cnt"]
+                market_count = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM markets WHERE active = 1"
+                ).fetchone()["cnt"]
+                conn.close()
+
+                msg = (
+                    f"<b>5-Min Update</b>\n"
+                    f"Portfolio: ${stats['current_value']:.2f}\n"
+                    f"P&L: ${stats['total_pnl']:.2f}\n"
+                    f"Trades: {stats['total_trades']} (W:{stats['win_rate']:.0%})\n"
+                    f"Open: {stats['open_positions']}\n"
+                    f"Signals (5m): {recent_signals}\n"
+                    f"Markets: {market_count} | Wallets: {tracked_count}\n"
+                    f"Status: {'PAUSED' if stats['is_paused'] else 'ACTIVE'}"
+                )
+                await self.notifier.send_message(msg)
+            except Exception as e:
+                log.error(f"Status update error: {e}")
+                await asyncio.sleep(60)
+
     async def daily_refresh(self):
         while self.running:
             try:
@@ -200,6 +234,7 @@ class PolyBot:
             asyncio.create_task(self.market_loop()),
             asyncio.create_task(self.price_loop()),
             asyncio.create_task(self.wallet_monitor_loop()),
+            asyncio.create_task(self.status_update_loop()),
             asyncio.create_task(self.daily_refresh()),
         ]
         try:
