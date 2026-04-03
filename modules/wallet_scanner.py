@@ -20,6 +20,18 @@ class WalletScanner:
         conn.close()
         return [dict(r) for r in rows]
 
+    def _get_wallet_pnl(self, address: str) -> dict | None:
+        """Get P&L data from wallets table (populated by fetch_wallet_positions)."""
+        conn = get_connection(self.db_path)
+        row = conn.execute(
+            "SELECT wins, losses, win_rate, total_pnl FROM wallets WHERE address = ?",
+            (address,),
+        ).fetchone()
+        conn.close()
+        if row and (row["wins"] + row["losses"]) > 0:
+            return dict(row)
+        return None
+
     def score_wallet(self, address: str) -> dict:
         trades = self._get_wallet_trades(address)
         total = len(trades)
@@ -40,62 +52,110 @@ class WalletScanner:
         if total < self.config.MIN_WALLET_TRADES:
             return result
 
-        wins = sum(1 for t in trades if t["outcome"] == "won")
-        losses = sum(1 for t in trades if t["outcome"] == "lost")
-        resolved = wins + losses
-        pending = sum(1 for t in trades if t["outcome"] == "pending")
-        win_rate = wins / resolved if resolved > 0 else 0
-        total_pnl = sum(t["pnl"] for t in trades)
+        # Try to use real P&L data from positions API first
+        pnl_data = self._get_wallet_pnl(address)
+        if pnl_data:
+            wins = pnl_data["wins"]
+            losses = pnl_data["losses"]
+            win_rate = pnl_data["win_rate"]
+            total_pnl = pnl_data["total_pnl"]
+            resolved = wins + losses
+        else:
+            # Fall back to trade-level outcomes
+            wins = sum(1 for t in trades if t["outcome"] == "won")
+            losses = sum(1 for t in trades if t["outcome"] == "lost")
+            resolved = wins + losses
+            win_rate = wins / resolved if resolved > 0 else 0
+            total_pnl = sum(t["pnl"] for t in trades)
 
-        # If no resolved trades yet, score by volume and activity instead
-        if resolved == 0:
-            total_volume = sum(t["size"] for t in trades)
-            # Volume score (0-100): higher volume = higher score
-            volume_score = min(100, total_volume / 100)
-            # Activity score (0-100): more trades = higher score
-            activity_score = min(100, total * 2)
-            # Recency
-            now = datetime.now(timezone.utc)
-            recent_cutoff = now - timedelta(days=7)
-            recent_trades = [
-                t for t in trades
-                if t["timestamp"] and t["timestamp"] > recent_cutoff.isoformat()
-            ]
-            recency = (len(recent_trades) / total * 100) if total > 0 else 0
+        total_volume = sum(t["size"] for t in trades)
 
-            composite = (
-                volume_score * 0.40
-                + activity_score * 0.35
-                + recency * 0.25
-            )
+        # Recency calculation
+        now = datetime.now(timezone.utc)
+        recent_cutoff = now - timedelta(days=7)
+        recent_trades = [
+            t for t in trades
+            if t["timestamp"] and t["timestamp"] > recent_cutoff.isoformat()
+        ]
+        recency = (len(recent_trades) / total * 100) if total > 0 else 0
+
+        # If we have real P&L data, use profitability-based scoring
+        if resolved > 0:
+            # PnL score (0-40): profitable wallets score higher
+            pnl_score = min(40, max(0, (total_pnl / 100) + 20))
+            # Win rate score (0-25): higher win rate = higher score
+            wr_score = win_rate * 25
+            # Volume score (0-20): more volume = more data = more reliable
+            vol_score = min(20, total_volume / 500)
+            # Recency (0-15)
+            recency_score = recency * 0.15
+
+            composite = pnl_score + wr_score + vol_score + recency_score
 
             result.update({
                 "wins": wins,
                 "losses": losses,
                 "win_rate": win_rate,
                 "total_pnl": total_pnl,
-                "consistency_score": volume_score,
-                "frequency_score": activity_score,
-                "recency_score": recency,
+                "consistency_score": pnl_score,
+                "frequency_score": vol_score,
+                "recency_score": recency_score,
                 "composite_score": composite,
             })
 
             # Persist
             conn = get_connection(self.db_path)
             conn.execute(
-                """INSERT OR REPLACE INTO wallets
-                   (address, total_trades, wins, losses, win_rate, total_pnl,
-                    avg_bet_size, consistency_score, frequency_score, recency_score,
-                    composite_score, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (address, total, wins, losses, win_rate, total_pnl,
-                 total_volume / total if total > 0 else 0,
-                 volume_score, activity_score, recency, composite,
-                 datetime.now(timezone.utc).isoformat()),
+                """UPDATE wallets SET
+                   total_trades = ?, composite_score = ?,
+                   avg_bet_size = ?, consistency_score = ?,
+                   frequency_score = ?, recency_score = ?, updated_at = ?
+                   WHERE address = ?""",
+                (total, composite, total_volume / total if total > 0 else 0,
+                 pnl_score, vol_score, recency_score,
+                 datetime.now(timezone.utc).isoformat(), address),
             )
             conn.commit()
             conn.close()
             return result
+
+        # No P&L data — fall back to volume/activity scoring
+        volume_score = min(100, total_volume / 100)
+        activity_score = min(100, total * 2)
+
+        composite = (
+            volume_score * 0.40
+            + activity_score * 0.35
+            + recency * 0.25
+        )
+
+        result.update({
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "total_pnl": total_pnl,
+            "consistency_score": volume_score,
+            "frequency_score": activity_score,
+            "recency_score": recency,
+            "composite_score": composite,
+        })
+
+        # Persist
+        conn = get_connection(self.db_path)
+        conn.execute(
+            """INSERT OR REPLACE INTO wallets
+               (address, total_trades, wins, losses, win_rate, total_pnl,
+                avg_bet_size, consistency_score, frequency_score, recency_score,
+                composite_score, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (address, total, wins, losses, win_rate, total_pnl,
+             total_volume / total if total > 0 else 0,
+             volume_score, activity_score, recency, composite,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+        return result
 
         # With resolved trades, use win-rate based scoring
         if win_rate < self.config.MIN_WALLET_WIN_RATE:

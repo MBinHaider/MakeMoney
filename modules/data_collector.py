@@ -225,6 +225,52 @@ class DataCollector:
             log.info(f"Fetched {len(trades)} trades for wallet {wallet_address[:10]}...")
         return trades
 
+    async def fetch_wallet_positions(self, wallet_address: str) -> dict:
+        """Fetch wallet positions and P&L from data-api. Returns profitability summary."""
+        url = "https://data-api.polymarket.com/positions"
+        params = {"user": wallet_address, "limit": 100}
+        try:
+            positions = await self._get_json(url, params)
+        except Exception as e:
+            log.error(f"Failed to fetch positions for {wallet_address[:10]}: {e}")
+            return {"total_pnl": 0, "win_count": 0, "loss_count": 0}
+
+        total_pnl = 0.0
+        win_count = 0
+        loss_count = 0
+
+        for p in positions:
+            pnl = float(p.get("cashPnl", 0))
+            total_pnl += pnl
+            if pnl > 0:
+                win_count += 1
+            elif pnl < 0:
+                loss_count += 1
+
+        # Update wallets table with real P&L data
+        total_positions = win_count + loss_count
+        win_rate = win_count / total_positions if total_positions > 0 else 0
+
+        conn = get_connection(self.db_path)
+        conn.execute("INSERT OR IGNORE INTO wallets (address) VALUES (?)", (wallet_address,))
+        conn.execute(
+            """UPDATE wallets SET
+               wins = ?, losses = ?, win_rate = ?, total_pnl = ?, updated_at = ?
+               WHERE address = ?""",
+            (win_count, loss_count, win_rate, total_pnl,
+             datetime.now(timezone.utc).isoformat(), wallet_address),
+        )
+        conn.commit()
+        conn.close()
+
+        if total_positions > 0:
+            log.info(
+                f"Wallet {wallet_address[:10]}: PnL=${total_pnl:,.2f} | "
+                f"W/L={win_count}/{loss_count} ({win_rate:.0%})"
+            )
+
+        return {"total_pnl": total_pnl, "win_count": win_count, "loss_count": loss_count, "win_rate": win_rate}
+
     async def fetch_price_candles(self, asset: str, limit: int = 60) -> list[dict]:
         symbol = f"{asset}USDT"
         url = f"{self.config.BINANCE_API_URL}/api/v3/klines"

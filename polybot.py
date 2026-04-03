@@ -62,9 +62,10 @@ class PolyBot:
             wallets = await self.collector.discover_whale_wallets()
             if wallets:
                 await self.notifier.send_message(f"Discovered {len(wallets)} wallets. Analyzing...")
-                # Fetch trade history for each wallet
+                # Fetch trade history AND positions (P&L) for each wallet
                 for addr in wallets[:50]:  # Cap at 50 to avoid rate limits
                     await self.collector.fetch_wallet_trades_public(addr)
+                    await self.collector.fetch_wallet_positions(addr)
 
                 # Step 4: Score and rank wallets
                 tracked = self.scanner.rank_and_track()
@@ -102,7 +103,19 @@ class PolyBot:
         while self.running:
             try:
                 new_trades = await self.collector.poll_tracked_wallets()
-                for trade in new_trades:
+                # Only process trades on our tracked crypto markets
+                from utils.db import get_connection
+                conn = get_connection(self.config.DB_PATH)
+                tracked_markets = set(
+                    r["condition_id"] for r in
+                    conn.execute("SELECT condition_id FROM markets WHERE active = 1").fetchall()
+                )
+                conn.close()
+
+                crypto_trades = [t for t in new_trades if t.get("market_id") in tracked_markets]
+                if crypto_trades:
+                    log.info(f"Processing {len(crypto_trades)} crypto trades (filtered from {len(new_trades)} total)")
+                for trade in crypto_trades:
                     await self.process_whale_trade(trade)
                 await asyncio.sleep(self.config.WALLET_POLL_INTERVAL_SEC)
             except Exception as e:

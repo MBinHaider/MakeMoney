@@ -47,18 +47,34 @@ class SignalEngine:
         wallet = self._get_wallet_info(address)
         if wallet is None:
             return 0.0
+
+        # Rank score (0-12)
         if rank <= 5:
-            rank_pts = 15.0
+            rank_pts = 12.0
         elif rank <= 10:
-            rank_pts = 10.0
+            rank_pts = 8.0
         else:
-            rank_pts = 5.0
+            rank_pts = 4.0
+
+        # Conviction score (0-10): bet size relative to average
         avg_bet = wallet.get("avg_bet_size", 1.0) or 1.0
         size_ratio = trade.get("size", 0) / avg_bet
-        conviction_pts = min(15.0, size_ratio * 5.0)
-        wr = wallet.get("win_rate", 0.5)
-        wr_pts = wr * 10.0
-        return min(40.0, rank_pts + conviction_pts + wr_pts)
+        conviction_pts = min(10.0, size_ratio * 3.0)
+
+        # Profitability score (0-18): real P&L weighted heavily
+        total_pnl = wallet.get("total_pnl", 0) or 0
+        wr = wallet.get("win_rate", 0) or 0
+        if total_pnl > 0 and wr > 0.5:
+            # Profitable wallet with winning record
+            profit_pts = min(18.0, 10.0 + (wr * 8.0))
+        elif total_pnl > 0:
+            profit_pts = 8.0
+        elif wr > 0:
+            profit_pts = wr * 6.0
+        else:
+            profit_pts = 3.0  # Unknown profitability, small baseline
+
+        return min(40.0, rank_pts + conviction_pts + profit_pts)
 
     def _calc_market_score(self, market_id: str, direction: str) -> float:
         market = self._get_market_info(market_id)
