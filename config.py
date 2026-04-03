@@ -10,6 +10,9 @@ class Config:
     GAMMA_API_URL = "https://gamma-api.polymarket.com"
     BINANCE_API_URL = "https://api.binance.com"
 
+    # SOCKS5 proxy for Polymarket API (Cloudflare WARP proxy mode)
+    PROXY_URL = os.getenv("PROXY_URL", "socks5://127.0.0.1:40000")
+
     # Secrets (from .env)
     PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -22,9 +25,9 @@ class Config:
     CHAIN_ID = 137  # Polygon
 
     # Polling intervals (seconds)
-    MARKET_POLL_INTERVAL_SEC = 30
-    WALLET_POLL_INTERVAL_SEC = 15
-    PRICE_POLL_INTERVAL_SEC = 10
+    MARKET_POLL_INTERVAL_SEC = 60      # Markets change slowly
+    WALLET_POLL_INTERVAL_SEC = 30      # Check for new whale trades every 30s
+    PRICE_POLL_INTERVAL_SEC = 30       # Price candles every 30s
 
     # Signal thresholds
     SIGNAL_AUTO_TRADE_THRESHOLD = 70
@@ -45,7 +48,7 @@ class Config:
     BASE_BET_PCT = 0.02  # 2% of portfolio per trade
 
     # Wallet scanner
-    MIN_WALLET_TRADES = 100
+    MIN_WALLET_TRADES = 10  # Low initially to bootstrap; raise to 100 once data accumulates
     MIN_WALLET_WIN_RATE = 0.52
     TOP_TRACKED_WALLETS = 20
     WALLET_LOOKBACK_DAYS = 90

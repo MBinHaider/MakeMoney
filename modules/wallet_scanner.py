@@ -41,10 +41,63 @@ class WalletScanner:
             return result
 
         wins = sum(1 for t in trades if t["outcome"] == "won")
-        losses = total - wins
-        win_rate = wins / total if total > 0 else 0
+        losses = sum(1 for t in trades if t["outcome"] == "lost")
+        resolved = wins + losses
+        pending = sum(1 for t in trades if t["outcome"] == "pending")
+        win_rate = wins / resolved if resolved > 0 else 0
         total_pnl = sum(t["pnl"] for t in trades)
 
+        # If no resolved trades yet, score by volume and activity instead
+        if resolved == 0:
+            total_volume = sum(t["size"] for t in trades)
+            # Volume score (0-100): higher volume = higher score
+            volume_score = min(100, total_volume / 100)
+            # Activity score (0-100): more trades = higher score
+            activity_score = min(100, total * 2)
+            # Recency
+            now = datetime.now(timezone.utc)
+            recent_cutoff = now - timedelta(days=7)
+            recent_trades = [
+                t for t in trades
+                if t["timestamp"] and t["timestamp"] > recent_cutoff.isoformat()
+            ]
+            recency = (len(recent_trades) / total * 100) if total > 0 else 0
+
+            composite = (
+                volume_score * 0.40
+                + activity_score * 0.35
+                + recency * 0.25
+            )
+
+            result.update({
+                "wins": wins,
+                "losses": losses,
+                "win_rate": win_rate,
+                "total_pnl": total_pnl,
+                "consistency_score": volume_score,
+                "frequency_score": activity_score,
+                "recency_score": recency,
+                "composite_score": composite,
+            })
+
+            # Persist
+            conn = get_connection(self.db_path)
+            conn.execute(
+                """INSERT OR REPLACE INTO wallets
+                   (address, total_trades, wins, losses, win_rate, total_pnl,
+                    avg_bet_size, consistency_score, frequency_score, recency_score,
+                    composite_score, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (address, total, wins, losses, win_rate, total_pnl,
+                 total_volume / total if total > 0 else 0,
+                 volume_score, activity_score, recency, composite,
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+            conn.close()
+            return result
+
+        # With resolved trades, use win-rate based scoring
         if win_rate < self.config.MIN_WALLET_WIN_RATE:
             result["wins"] = wins
             result["losses"] = losses
@@ -53,8 +106,9 @@ class WalletScanner:
             return result
 
         # Consistency: standard deviation of PnL per trade (lower = more consistent)
-        avg_pnl = total_pnl / total if total > 0 else 0
-        variance = sum((t["pnl"] - avg_pnl) ** 2 for t in trades) / total
+        resolved_trades = [t for t in trades if t["outcome"] in ("won", "lost")]
+        avg_pnl = total_pnl / len(resolved_trades) if resolved_trades else 0
+        variance = sum((t["pnl"] - avg_pnl) ** 2 for t in resolved_trades) / len(resolved_trades) if resolved_trades else 0
         std_pnl = variance ** 0.5
         consistency = max(0, 1 - (std_pnl / (abs(avg_pnl) + 1))) * 100
 

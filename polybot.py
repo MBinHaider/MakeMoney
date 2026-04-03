@@ -48,12 +48,36 @@ class PolyBot:
 
     async def initial_scan(self):
         log.info("Running initial wallet scan...")
-        await self.notifier.send_message("Running initial wallet scan...")
-        await self.collector.fetch_active_markets()
-        for asset in self.config.TARGET_MARKETS:
-            await self.collector.fetch_price_candles(asset)
-        log.info("Initial scan complete. Monitoring for wallet activity...")
-        await self.notifier.send_message("Initial scan complete. Bot is now monitoring.")
+        await self.notifier.send_message("Running initial scan...")
+        try:
+            # Step 1: Find crypto markets
+            markets = await self.collector.fetch_active_markets()
+            await self.notifier.send_message(f"Found {len(markets)} crypto markets")
+
+            # Step 2: Fetch price data
+            for asset in self.config.TARGET_MARKETS:
+                await self.collector.fetch_price_candles(asset)
+
+            # Step 3: Discover whale wallets from market trades
+            wallets = await self.collector.discover_whale_wallets()
+            if wallets:
+                await self.notifier.send_message(f"Discovered {len(wallets)} wallets. Analyzing...")
+                # Fetch trade history for each wallet
+                for addr in wallets[:50]:  # Cap at 50 to avoid rate limits
+                    await self.collector.fetch_wallet_trades_public(addr)
+
+                # Step 4: Score and rank wallets
+                tracked = self.scanner.rank_and_track()
+                await self.notifier.send_message(
+                    f"Tracking {len(tracked)} top wallets. Bot is now monitoring."
+                )
+            else:
+                await self.notifier.send_message("No wallets found yet. Will keep scanning.")
+
+            log.info("Initial scan complete.")
+        except Exception as e:
+            log.warning(f"Initial scan failed (will retry in loops): {e}")
+            await self.notifier.send_message(f"Initial scan failed, will retry: {type(e).__name__}")
 
     async def market_loop(self):
         while self.running:
@@ -103,19 +127,26 @@ class PolyBot:
                 await asyncio.sleep(3600)
 
     async def process_whale_trade(self, trade: dict):
+        # Get market name for better logging
+        market_name = trade.get("title", trade.get("slug", trade.get("market_id", "unknown")))[:40]
+        wallet = trade.get("wallet_address", "")[:10]
+
         signal = self.signal_engine.generate_signal(trade)
         if signal is None:
             return
+
         action = signal["action"]
+        score = signal["total_score"]
+
         if action == "auto_trade":
             can = self.risk_manager.can_trade()
             if not can["allowed"]:
-                log.info(f"Trade blocked by risk manager: {can['reason']}")
+                log.info(f"Trade blocked: {can['reason']}")
                 await self.notifier.send_message(
-                    f"Signal blocked: {can['reason']}\nScore: {signal['total_score']:.1f}"
+                    f"Signal blocked: {can['reason']}\nScore: {score:.1f}"
                 )
                 return
-            size = self.risk_manager.calc_position_size(signal["total_score"])
+            size = self.risk_manager.calc_position_size(score)
             from utils.db import get_connection
             conn = get_connection(self.config.DB_PATH)
             market = conn.execute(
@@ -124,19 +155,25 @@ class PolyBot:
             ).fetchone()
             conn.close()
             if market is None:
-                log.warning(f"Market not found: {signal['market_id']}")
+                log.warning(f"Market not found for auto-trade: {signal['market_id'][:10]}")
                 return
             market = dict(market)
             result = self.executor.execute(signal, market, size)
             if result["status"] == "filled":
-                msg = self.notifier.format_trade_alert(result, signal["total_score"])
+                msg = self.notifier.format_trade_alert(result, score)
                 await self.notifier.send_message(msg)
+
         elif action == "alert":
-            await self.notifier.send_message(
-                f"<b>SIGNAL DETECTED</b>\nDirection: {signal['direction']}\n"
-                f"Market: {signal['market_id'][:20]}\nScore: {signal['total_score']:.1f}\n"
-                f"(Below auto-trade threshold)"
-            )
+            # Only send Telegram alerts for high-quality signals (score >= 55)
+            if score >= 55:
+                await self.notifier.send_message(
+                    f"<b>SIGNAL ALERT</b>\n"
+                    f"Whale: {wallet}...\n"
+                    f"Direction: {signal['direction']}\n"
+                    f"Market: {market_name}\n"
+                    f"Score: {score:.1f}/100\n"
+                    f"W:{signal['whale_score']:.0f} M:{signal['market_score']:.0f} C:{signal['confluence_score']:.0f}"
+                )
 
     def stop(self):
         log.info("Stopping PolyBot...")

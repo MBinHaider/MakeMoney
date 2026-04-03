@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timezone
 from utils.db import get_connection
 from utils.logger import get_logger
@@ -11,6 +12,10 @@ class TradeExecutor:
         self.config = config
         self.db_path = config.DB_PATH
         self._clob_client = None
+        # Set proxy env vars so py-clob-client (httpx) routes through WARP
+        if config.PROXY_URL:
+            os.environ["ALL_PROXY"] = config.PROXY_URL
+            os.environ["HTTPS_PROXY"] = config.PROXY_URL
 
     def _signal_id_exists(self, conn, signal_id) -> bool:
         """Return True only if signal_id is not None and exists in the signals table."""
