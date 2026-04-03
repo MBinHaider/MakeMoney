@@ -173,6 +173,7 @@ class PolyBot:
             market = dict(market)
             result = self.executor.execute(signal, market, size)
             if result["status"] == "filled":
+                result["market_id"] = market.get("question", signal["market_id"][:20])
                 msg = self.notifier.format_trade_alert(result, score)
                 await self.notifier.send_message(msg)
 
