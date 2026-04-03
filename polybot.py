@@ -99,6 +99,31 @@ class PolyBot:
                 log.error(f"Price loop error: {e}")
                 await asyncio.sleep(5)
 
+    async def trade_resolution_loop(self):
+        """Resolve paper trades every 2 minutes and update portfolio."""
+        while self.running:
+            try:
+                await asyncio.sleep(120)  # Check every 2 minutes
+                resolved = self.executor.resolve_paper_trades()
+                for r in resolved:
+                    self.risk_manager.record_trade_outcome(r["pnl"])
+                    won_str = "WON" if r["won"] else "LOST"
+                    stats = self.risk_manager.get_status()
+                    msg = (
+                        f"<b>Trade {won_str}!</b>\n"
+                        f"Market: {str(r['market'])[:40]}\n"
+                        f"Direction: {r['side']}\n"
+                        f"Entry: {r['entry_price']:.4f} → Exit: {r['exit_price']:.4f}\n"
+                        f"P&L: ${r['pnl']:.2f}\n"
+                        f"Portfolio: ${stats['current_value']:.2f}"
+                    )
+                    await self.notifier.send_message(msg)
+                if resolved:
+                    log.info(f"Resolved {len(resolved)} trades")
+            except Exception as e:
+                log.error(f"Trade resolution error: {e}")
+                await asyncio.sleep(30)
+
     async def wallet_monitor_loop(self):
         while self.running:
             try:
@@ -326,6 +351,7 @@ class PolyBot:
             asyncio.create_task(self.market_loop()),
             asyncio.create_task(self.price_loop()),
             asyncio.create_task(self.wallet_monitor_loop()),
+            asyncio.create_task(self.trade_resolution_loop()),
             asyncio.create_task(self.status_update_loop()),
             asyncio.create_task(self.daily_refresh()),
         ]

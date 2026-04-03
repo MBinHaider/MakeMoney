@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from utils.db import get_connection
 from utils.logger import get_logger
 from config import Config
@@ -141,3 +141,79 @@ class TradeExecutor:
         conn.close()
         log.info(f"Trade {trade_id} resolved: {'WON' if won else 'LOST'} | PnL: ${pnl:.2f}")
         return pnl
+
+    def resolve_paper_trades(self) -> list[dict]:
+        """Resolve pending paper trades based on current market prices.
+
+        For paper trading, we simulate resolution after 5 minutes:
+        - Compare current market price to entry price
+        - If price moved in our direction → win
+        - If price moved against us → loss
+        - PnL based on price difference * position size
+        """
+        conn = get_connection(self.db_path)
+        now = datetime.now(timezone.utc)
+        five_min_ago = (now - timedelta(minutes=5)).isoformat()
+
+        # Get paper trades older than 5 minutes that are still pending
+        pending = conn.execute(
+            """SELECT bt.*, m.price_yes, m.price_no, m.question
+               FROM bot_trades bt
+               LEFT JOIN markets m ON bt.market_id = m.condition_id
+               WHERE bt.outcome = 'pending' AND bt.timestamp < ?""",
+            (five_min_ago,),
+        ).fetchall()
+
+        results = []
+        for trade in pending:
+            trade = dict(trade)
+            side = trade["side"]
+            entry_price = trade["entry_price"]
+            size = trade["size"]
+
+            # Get current price from market
+            current_yes = trade.get("price_yes") or 0.5
+            current_no = trade.get("price_no") or 0.5
+
+            if side == "BUY":
+                # Bought YES token — win if price went up
+                current_price = current_yes
+            else:
+                # Bought NO token — win if price went up (for NO)
+                current_price = current_no
+
+            # Calculate PnL: (current_price - entry_price) / entry_price * size
+            price_change = current_price - entry_price
+            if entry_price > 0:
+                pnl = (price_change / entry_price) * size
+            else:
+                pnl = 0
+
+            won = pnl > 0
+            outcome = "won" if won else "lost"
+
+            conn.execute(
+                "UPDATE bot_trades SET outcome = ?, pnl = ?, resolved_at = ? WHERE id = ?",
+                (outcome, round(pnl, 4), now.isoformat(), trade["id"]),
+            )
+
+            question = trade.get("question", trade["market_id"][:20])
+            results.append({
+                "trade_id": trade["id"],
+                "market": question,
+                "side": side,
+                "size": size,
+                "entry_price": entry_price,
+                "exit_price": current_price,
+                "pnl": pnl,
+                "won": won,
+            })
+
+            log.info(
+                f"Paper trade #{trade['id']} resolved: {'WON' if won else 'LOST'} | "
+                f"Entry: {entry_price:.4f} → Exit: {current_price:.4f} | PnL: ${pnl:.2f}"
+            )
+
+        conn.commit()
+        conn.close()
+        return results
