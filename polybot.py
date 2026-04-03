@@ -198,9 +198,15 @@ class PolyBot:
 
     async def status_update_loop(self):
         """Send learning progress update to Telegram every 5 minutes."""
+        first_run = True
         while self.running:
             try:
-                await asyncio.sleep(300)  # 5 minutes
+                if first_run:
+                    await asyncio.sleep(60)  # First update after 1 minute
+                    first_run = False
+                else:
+                    await asyncio.sleep(300)  # Then every 5 minutes
+                log.info("Sending 5-min progress report...")
                 stats = self.risk_manager.get_status()
                 conn = get_connection(self.config.DB_PATH)
                 m = self._calc_maturity_level(conn)

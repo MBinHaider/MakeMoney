@@ -107,11 +107,27 @@ class Notifier:
         await update.message.reply_text(msg)
 
     async def send_message(self, text: str) -> None:
+        # Try the app bot first, fall back to direct HTTP
+        sent = False
         if self._app and self._app.bot:
             try:
                 await self._app.bot.send_message(chat_id=self.chat_id, text=text, parse_mode="HTML")
+                sent = True
             except Exception as e:
-                log.error(f"Failed to send Telegram message: {e}")
+                log.error(f"App send failed, trying HTTP: {e}")
+
+        if not sent and self.config.TELEGRAM_BOT_TOKEN and self.chat_id:
+            try:
+                import aiohttp
+                url = f"https://api.telegram.org/bot{self.config.TELEGRAM_BOT_TOKEN}/sendMessage"
+                async with aiohttp.ClientSession() as session:
+                    await session.post(url, json={
+                        "chat_id": self.chat_id,
+                        "text": text,
+                        "parse_mode": "HTML",
+                    })
+            except Exception as e:
+                log.error(f"HTTP send also failed: {e}")
 
     def format_trade_alert(self, trade: dict, signal_score: float) -> str:
         return (f"<b>TRADE EXECUTED</b>\nDirection: {trade['side']}\n"
