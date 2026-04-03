@@ -107,25 +107,20 @@ class Notifier:
         await update.message.reply_text(msg)
 
     async def send_message(self, text: str) -> None:
-        # Try the app bot first, fall back to direct HTTP
-        sent = False
-        if self._app and self._app.bot:
-            try:
-                await self._app.bot.send_message(chat_id=self.chat_id, text=text, parse_mode="HTML")
-                sent = True
-            except Exception as e:
-                log.error(f"App send failed, trying HTTP: {e}")
-
-        if not sent and self.config.TELEGRAM_BOT_TOKEN and self.chat_id:
+        # Always use direct HTTP — more reliable than app bot in async context
+        if self.config.TELEGRAM_BOT_TOKEN and self.chat_id:
             try:
                 import aiohttp
                 url = f"https://api.telegram.org/bot{self.config.TELEGRAM_BOT_TOKEN}/sendMessage"
                 async with aiohttp.ClientSession() as session:
-                    await session.post(url, json={
+                    resp = await session.post(url, json={
                         "chat_id": self.chat_id,
                         "text": text,
                         "parse_mode": "HTML",
                     })
+                    data = await resp.json()
+                    if not data.get("ok"):
+                        log.error(f"Telegram send failed: {data.get('description', 'unknown')}")
             except Exception as e:
                 log.error(f"HTTP send also failed: {e}")
 
