@@ -79,6 +79,9 @@ def test_score_wallet_below_min_trades_returns_zero(scanner):
 
 
 def test_score_wallet_below_min_win_rate_returns_zero(scanner):
+    # 2 wins + 5 losses = 7 trades total; set MIN_WALLET_TRADES=10 so wallet
+    # falls below minimum and gets a zero composite score regardless of win rate.
+    scanner.config.MIN_WALLET_TRADES = 10
     _insert_trades(TEST_DB, "0xCCC", num_wins=2, num_losses=5)
     score = scanner.score_wallet("0xCCC")
     assert score["composite_score"] == 0

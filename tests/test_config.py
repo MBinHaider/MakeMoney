@@ -23,8 +23,8 @@ def test_config_default_trading_mode_is_paper():
 
 def test_config_signal_thresholds():
     cfg = Config()
-    assert cfg.SIGNAL_AUTO_TRADE_THRESHOLD == 70
-    assert cfg.SIGNAL_ALERT_THRESHOLD == 50
+    assert cfg.SIGNAL_AUTO_TRADE_THRESHOLD == 60
+    assert cfg.SIGNAL_ALERT_THRESHOLD == 45
 
 
 def test_config_risk_limits():
@@ -39,13 +39,13 @@ def test_config_risk_limits():
 
 def test_config_wallet_scanner_settings():
     cfg = Config()
-    assert cfg.MIN_WALLET_TRADES == 100
+    assert cfg.MIN_WALLET_TRADES == 10
     assert cfg.MIN_WALLET_WIN_RATE == 0.52
     assert cfg.TOP_TRACKED_WALLETS == 20
 
 
 def test_config_polling_intervals():
     cfg = Config()
-    assert cfg.MARKET_POLL_INTERVAL_SEC == 30
-    assert cfg.WALLET_POLL_INTERVAL_SEC == 15
-    assert cfg.PRICE_POLL_INTERVAL_SEC == 10
+    assert cfg.MARKET_POLL_INTERVAL_SEC == 60
+    assert cfg.WALLET_POLL_INTERVAL_SEC == 30
+    assert cfg.PRICE_POLL_INTERVAL_SEC == 30
