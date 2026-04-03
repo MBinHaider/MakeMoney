@@ -131,6 +131,15 @@ class SignalEngine:
         address = whale_trade.get("wallet_address", "")
         market_id = whale_trade.get("market_id", "")
         direction = whale_trade.get("side", "BUY")
+
+        # Skip lopsided markets — no profit potential if one side is >85%
+        market = self._get_market_info(market_id)
+        if market:
+            price_yes = market.get("price_yes", 0.5)
+            price_no = market.get("price_no", 0.5)
+            if price_yes > 0.85 or price_no > 0.85:
+                return None  # Market already decided, skip
+
         whale_score = self._calc_whale_score(whale_trade)
         market_score = self._calc_market_score(market_id, direction)
         confluence_score = self._calc_confluence_score(market_id, direction)

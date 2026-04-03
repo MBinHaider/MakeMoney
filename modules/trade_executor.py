@@ -145,11 +145,11 @@ class TradeExecutor:
     def resolve_paper_trades(self) -> list[dict]:
         """Resolve pending paper trades based on current market prices.
 
-        For paper trading, we simulate resolution after 5 minutes:
-        - Compare current market price to entry price
-        - If price moved in our direction → win
-        - If price moved against us → loss
-        - PnL based on price difference * position size
+        For paper trading, we simulate resolution after 5 minutes.
+        Uses Polymarket's actual payout model:
+        - Shares bought = size / entry_price
+        - If you bought at 0.40 and current price is 0.55: PnL = shares * (0.55 - 0.40)
+        - If you bought at 0.40 and current price is 0.35: PnL = shares * (0.35 - 0.40) = negative
         """
         conn = get_connection(self.db_path)
         now = datetime.now(timezone.utc)
@@ -176,20 +176,25 @@ class TradeExecutor:
             current_no = trade.get("price_no") or 0.5
 
             if side == "BUY":
-                # Bought YES token — win if price went up
                 current_price = current_yes
             else:
-                # Bought NO token — win if price went up (for NO)
                 current_price = current_no
 
-            # Calculate PnL: (current_price - entry_price) / entry_price * size
-            price_change = current_price - entry_price
+            # Polymarket PnL: shares * price_change
             if entry_price > 0:
-                pnl = (price_change / entry_price) * size
+                shares = size / entry_price
+                price_change = current_price - entry_price
+                pnl = shares * price_change
             else:
                 pnl = 0
 
-            won = pnl > 0
+            # Treat tiny changes (< $0.01) as breakeven, not loss
+            if abs(pnl) < 0.01:
+                pnl = 0
+                won = True  # Breakeven counts as not-loss
+            else:
+                won = pnl > 0
+
             outcome = "won" if won else "lost"
 
             conn.execute(
