@@ -122,34 +122,120 @@ class PolyBot:
                 log.error(f"Wallet monitor error: {e}")
                 await asyncio.sleep(5)
 
+    def _calc_maturity_level(self, conn) -> dict:
+        """Calculate how mature/ready the bot is across key dimensions."""
+        # 1. Data coverage: how many wallets have P&L data
+        total_wallets = conn.execute("SELECT COUNT(*) as cnt FROM wallets WHERE total_trades > 0").fetchone()["cnt"]
+        wallets_with_pnl = conn.execute("SELECT COUNT(*) as cnt FROM wallets WHERE wins + losses > 0").fetchone()["cnt"]
+        data_pct = (wallets_with_pnl / max(1, total_wallets)) * 100
+
+        # 2. Signal quality: avg score of recent signals
+        avg_score_row = conn.execute(
+            "SELECT AVG(total_score) as avg, COUNT(*) as cnt FROM signals"
+        ).fetchone()
+        avg_signal_score = avg_score_row["avg"] or 0
+        total_signals = avg_score_row["cnt"] or 0
+
+        # 3. Trade experience: how many paper trades executed
+        total_trades = conn.execute("SELECT COUNT(*) as cnt FROM bot_trades").fetchone()["cnt"]
+        resolved_trades = conn.execute("SELECT COUNT(*) as cnt FROM bot_trades WHERE outcome != 'pending'").fetchone()["cnt"]
+        winning_trades = conn.execute("SELECT COUNT(*) as cnt FROM bot_trades WHERE outcome = 'won'").fetchone()["cnt"]
+
+        # 4. Whale intelligence: quality of tracked wallets
+        top_wallets = conn.execute(
+            "SELECT address, win_rate, total_pnl FROM wallets WHERE composite_score > 0 ORDER BY composite_score DESC LIMIT 5"
+        ).fetchall()
+        profitable_whales = sum(1 for w in top_wallets if w["total_pnl"] > 0)
+
+        # 5. Market coverage
+        market_count = conn.execute("SELECT COUNT(*) as cnt FROM markets WHERE active = 1").fetchone()["cnt"]
+
+        # Overall maturity score (0-100)
+        data_score = min(25, data_pct * 0.25)  # max 25
+        signal_score = min(25, (total_signals / 100) * 25)  # max 25 at 100+ signals
+        trade_score = min(25, (total_trades / 20) * 25)  # max 25 at 20+ trades
+        whale_score = min(25, (profitable_whales / 3) * 25)  # max 25 at 3+ profitable whales
+
+        maturity = data_score + signal_score + trade_score + whale_score
+
+        # Maturity level label
+        if maturity >= 80:
+            level = "READY FOR LIVE"
+            bar = "████████████████████ 🟢"
+        elif maturity >= 60:
+            level = "ALMOST READY"
+            bar = "████████████████░░░░ 🟡"
+        elif maturity >= 40:
+            level = "LEARNING"
+            bar = "████████████░░░░░░░░ 🟠"
+        elif maturity >= 20:
+            level = "EARLY STAGE"
+            bar = "████████░░░░░░░░░░░░ 🔴"
+        else:
+            level = "JUST STARTED"
+            bar = "████░░░░░░░░░░░░░░░░ 🔴"
+
+        return {
+            "maturity": maturity,
+            "level": level,
+            "bar": bar,
+            "data_pct": data_pct,
+            "total_wallets": total_wallets,
+            "wallets_with_pnl": wallets_with_pnl,
+            "total_signals": total_signals,
+            "avg_signal_score": avg_signal_score,
+            "total_trades": total_trades,
+            "resolved_trades": resolved_trades,
+            "winning_trades": winning_trades,
+            "profitable_whales": profitable_whales,
+            "top_whales": top_wallets,
+            "market_count": market_count,
+            "data_score": data_score,
+            "signal_score": signal_score,
+            "trade_score": trade_score,
+            "whale_score": whale_score,
+        }
+
     async def status_update_loop(self):
-        """Send status update to Telegram every 5 minutes."""
+        """Send learning progress update to Telegram every 5 minutes."""
         while self.running:
             try:
                 await asyncio.sleep(300)  # 5 minutes
                 stats = self.risk_manager.get_status()
-
                 conn = get_connection(self.config.DB_PATH)
-                recent_signals = conn.execute(
-                    "SELECT COUNT(*) as cnt FROM signals WHERE timestamp > datetime('now', '-5 minutes')"
-                ).fetchone()["cnt"]
-                tracked_count = conn.execute(
-                    "SELECT COUNT(*) as cnt FROM tracked_wallets"
-                ).fetchone()["cnt"]
-                market_count = conn.execute(
-                    "SELECT COUNT(*) as cnt FROM markets WHERE active = 1"
-                ).fetchone()["cnt"]
+                m = self._calc_maturity_level(conn)
                 conn.close()
 
+                # Top whale summary
+                whale_lines = ""
+                for w in m["top_whales"][:3]:
+                    pnl = w["total_pnl"]
+                    wr = w["win_rate"]
+                    addr = w["address"][:8]
+                    emoji = "✅" if pnl > 0 else "❌"
+                    whale_lines += f"  {emoji} {addr}.. ${pnl:,.0f} ({wr:.0%})\n"
+
                 msg = (
-                    f"<b>5-Min Update</b>\n"
-                    f"Portfolio: ${stats['current_value']:.2f}\n"
-                    f"P&L: ${stats['total_pnl']:.2f}\n"
-                    f"Trades: {stats['total_trades']} (W:{stats['win_rate']:.0%})\n"
-                    f"Open: {stats['open_positions']}\n"
-                    f"Signals (5m): {recent_signals}\n"
-                    f"Markets: {market_count} | Wallets: {tracked_count}\n"
-                    f"Status: {'PAUSED' if stats['is_paused'] else 'ACTIVE'}"
+                    f"<b>📊 5-Min Progress Report</b>\n"
+                    f"\n"
+                    f"<b>Maturity: {m['level']}</b>\n"
+                    f"{m['bar']} {m['maturity']:.0f}/100\n"
+                    f"\n"
+                    f"<b>Learning Progress:</b>\n"
+                    f"  📈 Data: {m['wallets_with_pnl']}/{m['total_wallets']} wallets profiled ({m['data_pct']:.0f}%)\n"
+                    f"  🔍 Signals: {m['total_signals']} analyzed (avg score: {m['avg_signal_score']:.1f})\n"
+                    f"  💰 Trades: {m['total_trades']} paper ({m['winning_trades']}W/{m['resolved_trades'] - m['winning_trades']}L)\n"
+                    f"  🐋 Profitable whales: {m['profitable_whales']}/5 tracked\n"
+                    f"\n"
+                    f"<b>Score Breakdown:</b>\n"
+                    f"  Data: {m['data_score']:.0f}/25 | Signals: {m['signal_score']:.0f}/25\n"
+                    f"  Trades: {m['trade_score']:.0f}/25 | Whales: {m['whale_score']:.0f}/25\n"
+                    f"\n"
+                    f"<b>Top Whales:</b>\n"
+                    f"{whale_lines}"
+                    f"\n"
+                    f"<b>Portfolio:</b> ${stats['current_value']:.2f} (P&L: ${stats['total_pnl']:.2f})\n"
+                    f"Markets: {m['market_count']} | Status: {'⏸ PAUSED' if stats['is_paused'] else '▶ ACTIVE'}"
                 )
                 await self.notifier.send_message(msg)
             except Exception as e:
