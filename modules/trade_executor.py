@@ -143,25 +143,26 @@ class TradeExecutor:
         return pnl
 
     def resolve_paper_trades(self) -> list[dict]:
-        """Resolve pending paper trades based on current market prices.
+        """Resolve paper trades using Polymarket's real payout model.
 
-        For paper trading, we simulate resolution after 5 minutes.
-        Uses Polymarket's actual payout model:
-        - Shares bought = size / entry_price
-        - If you bought at 0.40 and current price is 0.55: PnL = shares * (0.55 - 0.40)
-        - If you bought at 0.40 and current price is 0.35: PnL = shares * (0.35 - 0.40) = negative
+        How Polymarket works:
+        - You buy YES at $0.15 → If event happens, you get $1.00 → PnL = +$0.85/share
+        - You buy NO at $0.20 → If event doesn't happen, you get $1.00 → PnL = +$0.80/share
+        - If wrong → token worth $0 → PnL = -entry_price/share
+
+        For paper mode, we check if the market has closed/resolved.
+        If still open, we track unrealized PnL based on current price movement.
         """
         conn = get_connection(self.db_path)
         now = datetime.now(timezone.utc)
-        five_min_ago = (now - timedelta(minutes=5)).isoformat()
 
-        # Get paper trades older than 5 minutes that are still pending
+        # Get all pending paper trades
         pending = conn.execute(
-            """SELECT bt.*, m.price_yes, m.price_no, m.question
+            """SELECT bt.*, m.price_yes, m.price_no, m.question, m.active as market_active,
+                      m.end_time
                FROM bot_trades bt
                LEFT JOIN markets m ON bt.market_id = m.condition_id
-               WHERE bt.outcome = 'pending' AND bt.timestamp < ?""",
-            (five_min_ago,),
+               WHERE bt.outcome = 'pending'"""
         ).fetchall()
 
         results = []
@@ -170,8 +171,9 @@ class TradeExecutor:
             side = trade["side"]
             entry_price = trade["entry_price"]
             size = trade["size"]
+            trade_age_min = (now - datetime.fromisoformat(trade["timestamp"].replace("Z", "+00:00"))).total_seconds() / 60
 
-            # Get current price from market
+            # Get current market price
             current_yes = trade.get("price_yes") or 0.5
             current_no = trade.get("price_no") or 0.5
 
@@ -180,44 +182,78 @@ class TradeExecutor:
             else:
                 current_price = current_no
 
-            # Polymarket PnL: shares * price_change
-            if entry_price > 0:
-                shares = size / entry_price
-                price_change = current_price - entry_price
-                pnl = shares * price_change
-            else:
-                pnl = 0
+            # Calculate shares bought
+            shares = size / entry_price if entry_price > 0 else 0
 
-            # Treat tiny changes (< $0.01) as breakeven, not loss
-            if abs(pnl) < 0.01:
-                pnl = 0
-                won = True  # Breakeven counts as not-loss
-            else:
-                won = pnl > 0
+            # Check if market is resolved (closed and price is 0 or 1)
+            market_resolved = False
+            if trade.get("market_active") == 0:
+                market_resolved = True
+            elif current_price <= 0.01 or current_price >= 0.99:
+                market_resolved = True
 
-            outcome = "won" if won else "lost"
+            if market_resolved:
+                # Market resolved — real Polymarket payout
+                if current_price >= 0.99:
+                    # Our side won: each share pays $1
+                    pnl = shares * (1.0 - entry_price)
+                    won = True
+                elif current_price <= 0.01:
+                    # Our side lost: shares worth $0
+                    pnl = -size
+                    won = False
+                else:
+                    # Market closed at some intermediate price
+                    pnl = shares * (current_price - entry_price)
+                    won = pnl > 0
 
-            conn.execute(
-                "UPDATE bot_trades SET outcome = ?, pnl = ?, resolved_at = ? WHERE id = ?",
-                (outcome, round(pnl, 4), now.isoformat(), trade["id"]),
-            )
+                outcome = "won" if won else "lost"
+                conn.execute(
+                    "UPDATE bot_trades SET outcome = ?, pnl = ?, resolved_at = ? WHERE id = ?",
+                    (outcome, round(pnl, 2), now.isoformat(), trade["id"]),
+                )
 
-            question = trade.get("question", trade["market_id"][:20])
-            results.append({
-                "trade_id": trade["id"],
-                "market": question,
-                "side": side,
-                "size": size,
-                "entry_price": entry_price,
-                "exit_price": current_price,
-                "pnl": pnl,
-                "won": won,
-            })
+                question = trade.get("question", trade["market_id"][:20])
+                results.append({
+                    "trade_id": trade["id"],
+                    "market": question,
+                    "side": side,
+                    "size": size,
+                    "entry_price": entry_price,
+                    "exit_price": current_price,
+                    "pnl": pnl,
+                    "won": won,
+                    "resolved": True,
+                })
 
-            log.info(
-                f"Paper trade #{trade['id']} resolved: {'WON' if won else 'LOST'} | "
-                f"Entry: {entry_price:.4f} → Exit: {current_price:.4f} | PnL: ${pnl:.2f}"
-            )
+                log.info(
+                    f"Paper trade #{trade['id']} RESOLVED: {'WON' if won else 'LOST'} | "
+                    f"Entry: {entry_price:.4f} → Final: {current_price:.4f} | "
+                    f"PnL: ${pnl:.2f} ({shares:.1f} shares)"
+                )
+
+            elif trade_age_min > 30:
+                # Trade is 30+ min old, still open — report unrealized P&L
+                unrealized_pnl = shares * (current_price - entry_price)
+                pnl_pct = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+
+                # Potential payout if we win
+                potential_win = shares * (1.0 - entry_price)
+
+                question = trade.get("question", trade["market_id"][:20])
+                results.append({
+                    "trade_id": trade["id"],
+                    "market": question,
+                    "side": side,
+                    "size": size,
+                    "entry_price": entry_price,
+                    "exit_price": current_price,
+                    "pnl": unrealized_pnl,
+                    "won": unrealized_pnl > 0,
+                    "resolved": False,
+                    "potential_win": potential_win,
+                    "age_hours": trade_age_min / 60,
+                })
 
         conn.commit()
         conn.close()

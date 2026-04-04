@@ -100,29 +100,76 @@ class PolyBot:
                 await asyncio.sleep(5)
 
     async def trade_resolution_loop(self):
-        """Resolve paper trades every 2 minutes and update portfolio."""
+        """Check paper trades every 5 minutes. Resolved trades update portfolio. Open trades report status."""
         while self.running:
             try:
-                await asyncio.sleep(120)  # Check every 2 minutes
-                resolved = self.executor.resolve_paper_trades()
-                for r in resolved:
-                    self.risk_manager.record_trade_outcome(r["pnl"])
-                    won_str = "WON" if r["won"] else "LOST"
-                    stats = self.risk_manager.get_status()
-                    msg = (
-                        f"<b>Trade {won_str}!</b>\n"
-                        f"Market: {str(r['market'])[:40]}\n"
-                        f"Direction: {r['side']}\n"
-                        f"Entry: {r['entry_price']:.4f} → Exit: {r['exit_price']:.4f}\n"
-                        f"P&L: ${r['pnl']:.2f}\n"
-                        f"Portfolio: ${stats['current_value']:.2f}"
-                    )
-                    await self.notifier.send_message(msg)
-                if resolved:
-                    log.info(f"Resolved {len(resolved)} trades")
+                await asyncio.sleep(300)  # Check every 5 minutes
+                results = self.executor.resolve_paper_trades()
+
+                resolved_count = 0
+                open_count = 0
+
+                for r in results:
+                    if r.get("resolved"):
+                        # Market resolved — record real PnL
+                        resolved_count += 1
+                        self.risk_manager.record_trade_outcome(r["pnl"])
+                        won_str = "WON" if r["won"] else "LOST"
+                        stats = self.risk_manager.get_status()
+                        msg = (
+                            f"<b>TRADE {won_str}!</b>\n"
+                            f"Market: {str(r['market'])[:40]}\n"
+                            f"Direction: {r['side']}\n"
+                            f"Bought at: {r['entry_price']:.2f} → Resolved: {r['exit_price']:.2f}\n"
+                            f"P&L: <b>${r['pnl']:.2f}</b>\n"
+                            f"Portfolio: ${stats['current_value']:.2f}"
+                        )
+                        await self.notifier.send_message(msg)
+                    else:
+                        # Still open — track unrealized
+                        open_count += 1
+
+                # Report open positions summary (not every single one)
+                if open_count > 0 and resolved_count == 0:
+                    conn = get_connection(self.config.DB_PATH)
+                    open_trades = conn.execute(
+                        """SELECT bt.side, bt.size, bt.entry_price, bt.signal_score,
+                                  m.question, m.price_yes, m.price_no
+                           FROM bot_trades bt
+                           LEFT JOIN markets m ON bt.market_id = m.condition_id
+                           WHERE bt.outcome = 'pending'
+                           ORDER BY bt.id DESC LIMIT 5"""
+                    ).fetchall()
+                    conn.close()
+
+                    if open_trades:
+                        lines = ""
+                        total_invested = 0
+                        total_potential = 0
+                        for t in open_trades:
+                            entry = t["entry_price"]
+                            size = t["size"]
+                            shares = size / entry if entry > 0 else 0
+                            potential = shares * (1.0 - entry)
+                            total_invested += size
+                            total_potential += potential
+                            q = (t["question"] or "")[:35]
+                            lines += f"  {t['side']} ${size:.2f} @ {entry:.2f} → pot. ${potential:.2f} | {q}\n"
+
+                        msg = (
+                            f"<b>Open Positions ({open_count})</b>\n"
+                            f"Invested: ${total_invested:.2f}\n"
+                            f"Potential payout if correct: ${total_potential:.2f}\n\n"
+                            f"{lines}"
+                            f"Waiting for markets to resolve..."
+                        )
+                        await self.notifier.send_message(msg)
+
+                if resolved_count > 0:
+                    log.info(f"Resolved {resolved_count} trades, {open_count} still open")
             except Exception as e:
                 log.error(f"Trade resolution error: {e}")
-                await asyncio.sleep(30)
+                await asyncio.sleep(60)
 
     async def wallet_monitor_loop(self):
         while self.running:
