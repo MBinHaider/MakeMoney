@@ -128,8 +128,7 @@ class PolyBot:
         while self.running:
             try:
                 new_trades = await self.collector.poll_tracked_wallets()
-                # Only process trades on our tracked crypto markets
-                from utils.db import get_connection
+                # Process trades on ANY tracked market
                 conn = get_connection(self.config.DB_PATH)
                 tracked_markets = set(
                     r["condition_id"] for r in
@@ -137,10 +136,10 @@ class PolyBot:
                 )
                 conn.close()
 
-                crypto_trades = [t for t in new_trades if t.get("market_id") in tracked_markets]
-                if crypto_trades:
-                    log.info(f"Processing {len(crypto_trades)} crypto trades (filtered from {len(new_trades)} total)")
-                for trade in crypto_trades:
+                matched = [t for t in new_trades if t.get("market_id") in tracked_markets]
+                if matched:
+                    log.info(f"Processing {len(matched)} trades on tracked markets (from {len(new_trades)} total)")
+                for trade in matched:
                     await self.process_whale_trade(trade)
                 await asyncio.sleep(self.config.WALLET_POLL_INTERVAL_SEC)
             except Exception as e:

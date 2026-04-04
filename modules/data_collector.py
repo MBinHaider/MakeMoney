@@ -53,89 +53,89 @@ class DataCollector:
         return ""
 
     async def fetch_active_markets(self) -> list[dict]:
-        # Use events API with crypto tag to find crypto markets
-        url = f"{self.config.GAMMA_API_URL}/events"
-        params = {"active": "true", "closed": "false", "limit": 200, "tag": "crypto"}
-        events = await self._get_json(url, params)
+        import json as _json
+
+        # Fetch ALL active markets sorted by volume (not just crypto)
+        url = f"{self.config.GAMMA_API_URL}/markets"
+        params = {
+            "active": "true",
+            "closed": "false",
+            "limit": 500,
+            "order": "volume24hr",
+            "ascending": "false",
+        }
+        raw_markets = await self._get_json(url, params)
 
         stored = []
         conn = get_connection(self.db_path)
         now = datetime.now(timezone.utc).isoformat()
 
-        for event in events:
-            markets = event.get("markets", [])
-            for m in markets:
-                if m.get("closed", True):
-                    continue
+        for m in raw_markets:
+            question = m.get("question", "")
+            if not question:
+                continue
 
-                question = m.get("question", "")
-                asset = self._is_crypto_market(question)
-                if not asset:
-                    # It's tagged crypto but question doesn't match — check event title
-                    event_title = event.get("title", "")
-                    asset = self._is_crypto_market(event_title)
-                    if not asset:
-                        continue
+            # Determine asset/category
+            asset = self._is_crypto_market(question)
+            if not asset:
+                asset = "GENERAL"  # Politics, sports, events, etc.
 
-                outcomes = m.get("outcomes", "[]")
-                if isinstance(outcomes, str):
-                    import json as _json
-                    try:
-                        outcomes = _json.loads(outcomes)
-                    except Exception:
-                        outcomes = ["Yes", "No"]
+            # Parse prices
+            prices = m.get("outcomePrices", "[]")
+            if isinstance(prices, str):
+                try:
+                    prices = _json.loads(prices)
+                except Exception:
+                    prices = ["0.5", "0.5"]
 
-                prices = m.get("outcomePrices", "[]")
-                if isinstance(prices, str):
-                    import json as _json
-                    try:
-                        prices = _json.loads(prices)
-                    except Exception:
-                        prices = ["0.5", "0.5"]
+            price_yes = float(prices[0]) if len(prices) > 0 else 0.5
+            price_no = float(prices[1]) if len(prices) > 1 else 0.5
 
-                price_yes = float(prices[0]) if len(prices) > 0 else 0.5
-                price_no = float(prices[1]) if len(prices) > 1 else 0.5
+            # Skip lopsided markets (>90% one side = no profit potential)
+            if price_yes > 0.90 or price_no > 0.90:
+                continue
 
-                # Get token IDs from clobTokenIds
-                clob_ids = m.get("clobTokenIds", "[]")
-                if isinstance(clob_ids, str):
-                    import json as _json
-                    try:
-                        clob_ids = _json.loads(clob_ids)
-                    except Exception:
-                        clob_ids = []
+            # Parse token IDs
+            clob_ids = m.get("clobTokenIds", "[]")
+            if isinstance(clob_ids, str):
+                try:
+                    clob_ids = _json.loads(clob_ids)
+                except Exception:
+                    clob_ids = []
 
-                if len(clob_ids) < 2:
-                    continue
+            if len(clob_ids) < 2:
+                continue
 
-                row = {
-                    "condition_id": m.get("conditionId", ""),
-                    "question": question,
-                    "token_id_yes": clob_ids[0],
-                    "token_id_no": clob_ids[1],
-                    "asset": asset,
-                    "price_yes": price_yes,
-                    "price_no": price_no,
-                    "volume": float(m.get("volumeNum", m.get("volume", 0)) or 0),
-                    "end_time": m.get("endDate", ""),
-                    "active": 1,
-                    "updated_at": now,
-                }
+            volume = float(m.get("volume24hr", m.get("volumeNum", m.get("volume", 0))) or 0)
 
-                conn.execute(
-                    """INSERT OR REPLACE INTO markets
-                       (condition_id, question, token_id_yes, token_id_no, asset,
-                        price_yes, price_no, volume, end_time, active, updated_at)
-                       VALUES (:condition_id, :question, :token_id_yes, :token_id_no,
-                               :asset, :price_yes, :price_no, :volume, :end_time,
-                               :active, :updated_at)""",
-                    row,
-                )
-                stored.append(row)
+            row = {
+                "condition_id": m.get("conditionId", ""),
+                "question": question,
+                "token_id_yes": clob_ids[0],
+                "token_id_no": clob_ids[1],
+                "asset": asset,
+                "price_yes": price_yes,
+                "price_no": price_no,
+                "volume": volume,
+                "end_time": m.get("endDate", ""),
+                "active": 1,
+                "updated_at": now,
+            }
+
+            conn.execute(
+                """INSERT OR REPLACE INTO markets
+                   (condition_id, question, token_id_yes, token_id_no, asset,
+                    price_yes, price_no, volume, end_time, active, updated_at)
+                   VALUES (:condition_id, :question, :token_id_yes, :token_id_no,
+                           :asset, :price_yes, :price_no, :volume, :end_time,
+                           :active, :updated_at)""",
+                row,
+            )
+            stored.append(row)
 
         conn.commit()
         conn.close()
-        log.info(f"Fetched {len(stored)} active crypto markets")
+        log.info(f"Fetched {len(stored)} active markets (all categories)")
         return stored
 
     async def discover_whale_wallets(self) -> list[str]:
