@@ -61,3 +61,37 @@ class Config:
 
     # Database
     DB_PATH = os.path.join(os.path.dirname(__file__), "data", "polybot.db")
+
+    # Binance API
+    BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+    BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+
+    # BinanceBot trading
+    BINANCE_TRADING_MODE = os.getenv("BINANCE_TRADING_MODE", "paper")
+    BINANCE_PAIRS = ["BTCUSDT", "ETHUSDT"]
+    BINANCE_CANDLE_INTERVAL_1M = "1m"
+    BINANCE_CANDLE_INTERVAL_5M = "5m"
+    BINANCE_POLL_INTERVAL_SEC = 60
+    BINANCE_SUMMARY_INTERVAL_SEC = 900  # 15 minutes
+    BINANCE_DAILY_REPORT_INTERVAL_SEC = 86400
+
+    # BinanceBot risk
+    BINANCE_MAX_PER_TRADE_PCT = 0.30
+    BINANCE_STRONG_SIGNAL_PCT = 0.30  # 3-of-3 indicator agreement
+    BINANCE_NORMAL_SIGNAL_PCT = 0.20  # 2-of-3 indicator agreement
+    BINANCE_MAX_POSITIONS = 3
+    BINANCE_STOP_LOSS_PCT = 0.01
+    BINANCE_TAKE_PROFIT_PCT = 0.015
+    BINANCE_TRAILING_STOP_STEP_PCT = 0.005
+    BINANCE_DAILY_LOSS_LIMIT_PCT = 0.05
+    BINANCE_CONSECUTIVE_LOSS_PAUSE = 3
+    BINANCE_PAUSE_DURATION_MIN = 15
+    BINANCE_MIN_TRADE_INTERVAL_SEC = 120
+    BINANCE_FEE_PCT = 0.001
+    BINANCE_SLIPPAGE_PCT = 0.001
+
+    # BinanceBot portfolio
+    BINANCE_STARTING_BALANCE = 45.00
+
+    # BinanceBot database
+    BINANCE_DB_PATH = os.path.join(os.path.dirname(__file__), "data", "binancebot.db")
