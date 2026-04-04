@@ -30,8 +30,8 @@ class Config:
     PRICE_POLL_INTERVAL_SEC = 30       # Price candles every 30s
 
     # Signal thresholds
-    SIGNAL_AUTO_TRADE_THRESHOLD = 60  # Lowered: crypto-only filter means higher quality signals
-    SIGNAL_ALERT_THRESHOLD = 45
+    SIGNAL_AUTO_TRADE_THRESHOLD = 50  # Paper testing: lower to generate trades for evaluation
+    SIGNAL_ALERT_THRESHOLD = 35
 
     # Risk limits
     MAX_CONCURRENT_POSITIONS = 10
