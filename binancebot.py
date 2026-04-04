@@ -52,6 +52,10 @@ class BinanceBot:
                     if symbol in all_candles and all_candles[symbol]["1m"]:
                         current_prices[symbol] = all_candles[symbol]["1m"][-1]["close"]
 
+                # Log prices each cycle
+                price_str = " | ".join(f"{s}: ${p:,.2f}" for s, p in current_prices.items())
+                log.info(f"Tick: {price_str}")
+
                 closed_trades = self.executor.check_open_positions(current_prices)
                 for closed in closed_trades:
                     self.risk_manager.record_trade_outcome(closed["pnl"])
@@ -78,6 +82,19 @@ class BinanceBot:
 
                     signal = self.signal_engine.evaluate(
                         symbol, indicators_1m, indicators_5m, current_price
+                    )
+
+                    # Log indicator readings
+                    rsi = indicators_1m.get("rsi")
+                    macd_h = indicators_1m.get("macd_histogram")
+                    bb_l = indicators_1m.get("bb_lower")
+                    bb_u = indicators_1m.get("bb_upper")
+                    rsi_str = f"{rsi:.1f}" if rsi else "N/A"
+                    log.info(
+                        f"{symbol} RSI:{rsi_str} MACD_H:{macd_h:.4f} "
+                        f"BB:[{bb_l:,.0f}-{bb_u:,.0f}] → {signal['action'].upper()}"
+                        if macd_h and bb_l and bb_u else
+                        f"{symbol} indicators not ready yet"
                     )
 
                     if signal["action"] == "hold":
