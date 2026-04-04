@@ -95,3 +95,19 @@ class Config:
 
     # BinanceBot database
     BINANCE_DB_PATH = os.path.join(os.path.dirname(__file__), "data", "binancebot.db")
+
+    # PolyBot 5M
+    FIVEMIN_TRADING_MODE = os.getenv("FIVEMIN_TRADING_MODE", "paper")
+    FIVEMIN_ASSETS = ["BTC", "ETH", "SOL"]
+    FIVEMIN_STARTING_BALANCE = 25.00
+    FIVEMIN_MAX_PER_TRADE = 5.00
+    FIVEMIN_CONFIDENCE_EARLY = 0.75
+    FIVEMIN_CONFIDENCE_MID = 0.60
+    FIVEMIN_CONFIDENCE_LATE = 0.55
+    FIVEMIN_ENTRY_CUTOFF_SEC = 10
+    FIVEMIN_COOLDOWN_LOSSES = 3
+    FIVEMIN_COOLDOWN_MINUTES = 15
+    FIVEMIN_DAILY_LOSS_LIMIT_PCT = 0.20
+    FIVEMIN_DAILY_TRADE_CAP = 50
+    FIVEMIN_DB_PATH = os.path.join(os.path.dirname(__file__), "data", "polybot5m.db")
+    POLYMARKET_PROXY_ADDRESS = os.getenv("POLYMARKET_PROXY_ADDRESS", "")
