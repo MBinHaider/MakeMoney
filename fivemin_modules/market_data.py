@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -11,7 +12,7 @@ from config import Config
 
 log = get_logger("fivemin_market_data")
 
-BINANCE_WS_BASE = "wss://stream.binance.com:9443/ws"
+BINANCE_WS_BASE = os.environ.get("BINANCE_WS_URL", "wss://data-stream.binance.vision/ws")
 BINANCE_SYMBOLS = {"BTC": "btcusdt", "ETH": "ethusdt", "SOL": "solusdt"}
 
 

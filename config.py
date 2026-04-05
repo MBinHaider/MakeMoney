@@ -8,7 +8,7 @@ class Config:
     # API URLs
     POLYMARKET_API_URL = "https://clob.polymarket.com"
     GAMMA_API_URL = "https://gamma-api.polymarket.com"
-    BINANCE_API_URL = "https://api.binance.com"
+    BINANCE_API_URL = os.getenv("BINANCE_API_URL", "https://data-api.binance.vision")
 
     # SOCKS5 proxy for Polymarket API (Cloudflare WARP proxy mode)
     PROXY_URL = os.getenv("PROXY_URL", "socks5://127.0.0.1:40000")
