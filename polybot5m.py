@@ -166,11 +166,12 @@ class PolyBot5M:
                     await asyncio.sleep(1)
                     continue
 
-                # Price filter: skip if ask > $0.70 (bad risk/reward) or < $0.05 (no liquidity)
-                if ask_price > 0.70 or ask_price < 0.05:
-                    log.info(f"Skipping {best.asset} {best.direction}: ask ${ask_price:.2f} outside range [$0.05-$0.70]")
-                    await asyncio.sleep(1)
-                    continue
+                # Price filter: only for paper mode (live uses limit orders at fair price)
+                if self.config.FIVEMIN_TRADING_MODE == "paper":
+                    if ask_price > 0.70 or ask_price < 0.05:
+                        log.info(f"Skipping {best.asset} {best.direction}: ask ${ask_price:.2f} outside range [$0.05-$0.70]")
+                        await asyncio.sleep(1)
+                        continue
 
                 # Position sizing: $5 for 3/3 agreement, $3 for 2/3
                 agreeing = sum(1 for v in best.indicators.values()

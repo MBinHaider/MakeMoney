@@ -17,15 +17,22 @@ class FiveMinTradeExecutor:
         self._clob_client = None
 
     def execute(self, signal: Signal, amount: float, ask_price: float,
-                token_id: str = "", condition_id: str = "") -> dict:
-        """Execute a trade. Paper or live depending on config."""
-        if ask_price <= 0:
-            return {"status": "error", "reason": "Invalid ask price"}
-
+                token_id: str = "", condition_id: str = "",
+                limit_price: float = 0.0) -> dict:
+        """Execute a trade. Paper or live depending on config.
+        For live: uses limit_price (or calculates one from confidence).
+        """
         if self.config.FIVEMIN_TRADING_MODE == "paper":
+            if ask_price <= 0:
+                return {"status": "error", "reason": "Invalid ask price"}
             return self._execute_paper(signal, amount, ask_price)
         else:
-            return self._execute_live(signal, amount, ask_price, token_id, condition_id)
+            # For live: place limit order at a fair price based on confidence
+            if limit_price <= 0:
+                # Map confidence to price: 0.60 conf → $0.50, 1.0 conf → $0.60
+                limit_price = round(0.40 + signal.confidence * 0.20, 2)
+                limit_price = max(0.40, min(0.65, limit_price))
+            return self._execute_live(signal, amount, limit_price, token_id, condition_id)
 
     def _execute_paper(self, signal: Signal, amount: float, ask_price: float) -> dict:
         shares = amount / ask_price
@@ -78,9 +85,11 @@ class FiveMinTradeExecutor:
         self._clob_client.set_api_creds(creds)
         log.info("LIVE: py-clob-client authenticated")
 
-    def _execute_live(self, signal: Signal, amount: float, ask_price: float,
+    def _execute_live(self, signal: Signal, amount: float, limit_price: float,
                       token_id: str, condition_id: str) -> dict:
-        """Place a real order on Polymarket via py-clob-client."""
+        """Place a limit order on Polymarket via py-clob-client.
+        Posts at a fair price (not the $0.99 ask) and waits for fill.
+        """
         if not token_id:
             log.error("LIVE: No token ID for order")
             return {"status": "error", "reason": "No token ID"}
@@ -91,19 +100,19 @@ class FiveMinTradeExecutor:
             log.error(f"LIVE: Auth failed: {e}")
             return {"status": "error", "reason": f"Auth failed: {e}"}
 
-        shares = amount / ask_price
+        shares = amount / limit_price
         now = datetime.now(timezone.utc).isoformat()
 
         try:
             from py_clob_client.clob_types import OrderArgs
             from py_clob_client.order_builder.constants import BUY
 
-            log.info(f"LIVE PLACING ORDER: BUY {signal.direction} {signal.asset} "
-                     f"{shares:.2f} shares @ ${ask_price:.4f} token={token_id[:20]}...")
+            log.info(f"LIVE LIMIT ORDER: BUY {signal.direction} {signal.asset} "
+                     f"{shares:.1f} shares @ ${limit_price:.2f} (${amount:.2f}) "
+                     f"conf={signal.confidence:.2f}")
 
-            # Build and sign the order
             order_args = OrderArgs(
-                price=ask_price,
+                price=limit_price,
                 size=shares,
                 side=BUY,
                 token_id=token_id,
@@ -112,34 +121,35 @@ class FiveMinTradeExecutor:
             resp = self._clob_client.post_order(signed_order)
 
             order_id = resp.get("orderID", resp.get("id", str(resp)))
-            log.info(f"LIVE ORDER SUBMITTED: {order_id}")
+            log.info(f"LIVE ORDER POSTED: {order_id}")
 
-            # Wait briefly for fill
+            # Wait up to 30 seconds for fill, checking every 5s
             import time
-            time.sleep(3)
+            filled = 0
+            status = "LIVE"
+            for check in range(6):
+                time.sleep(5)
+                try:
+                    order_status = self._clob_client.get_order(order_id)
+                    filled = float(order_status.get("size_matched", 0))
+                    status = order_status.get("status", "unknown")
+                    log.info(f"LIVE CHECK {check+1}/6: status={status} filled={filled:.1f}/{shares:.1f}")
+                    if filled > 0:
+                        break
+                except Exception as e:
+                    log.warning(f"Order check failed: {e}")
 
-            # Check if filled
-            try:
-                order_status = self._clob_client.get_order(order_id)
-                filled = float(order_status.get("size_matched", 0))
-                status = order_status.get("status", "unknown")
-                log.info(f"LIVE ORDER STATUS: {status} filled={filled}")
-            except Exception as e:
-                log.warning(f"Could not check order: {e}")
-                filled = shares  # Assume filled if can't check
-                status = "assumed_filled"
-
-            # If not filled at all, cancel
-            if filled == 0 and status not in ("MATCHED", "FILLED"):
+            # If not filled, cancel and move on
+            if filled == 0:
                 try:
                     self._clob_client.cancel(order_id)
-                    log.info(f"LIVE ORDER CANCELLED: {order_id}")
+                    log.info(f"LIVE ORDER CANCELLED (unfilled after 30s): {order_id}")
                 except Exception:
                     pass
-                return {"status": "error", "reason": "Order not filled"}
+                return {"status": "error", "reason": "Limit order not filled in 30s"}
 
-            actual_shares = filled if filled > 0 else shares
-            actual_cost = actual_shares * ask_price
+            actual_shares = filled
+            actual_cost = actual_shares * limit_price
 
             # Record in database
             conn = get_connection(self.db_path)
@@ -148,7 +158,7 @@ class FiveMinTradeExecutor:
                    (asset, direction, entry_price, shares, cost, result,
                     window_ts, signal_confidence, signal_phase, signal_details, timestamp)
                    VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
-                (signal.asset, signal.direction, ask_price, actual_shares, actual_cost,
+                (signal.asset, signal.direction, limit_price, actual_shares, actual_cost,
                  int(signal.timestamp), signal.confidence, signal.phase,
                  json.dumps({"order_id": order_id}), now),
             )
@@ -157,8 +167,8 @@ class FiveMinTradeExecutor:
             conn.close()
 
             log.info(
-                f"LIVE FILLED: BUY {signal.direction} {signal.asset} "
-                f"{actual_shares:.2f} shares @ ${ask_price} (${actual_cost:.2f})"
+                f"LIVE FILLED: {signal.direction} {signal.asset} "
+                f"{actual_shares:.1f} shares @ ${limit_price:.2f} (${actual_cost:.2f})"
             )
 
             return {
@@ -166,7 +176,7 @@ class FiveMinTradeExecutor:
                 "status": "filled",
                 "asset": signal.asset,
                 "direction": signal.direction,
-                "entry_price": ask_price,
+                "entry_price": limit_price,
                 "shares": actual_shares,
                 "cost": actual_cost,
                 "order_id": order_id,
