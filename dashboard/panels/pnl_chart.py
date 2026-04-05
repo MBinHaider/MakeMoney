@@ -16,7 +16,7 @@ def render_pnl_chart(pnl_history: dict) -> Panel:
     if len(bn) < 2:
         bn = [0, 0]
 
-    # Trim to last 50 points for readability
+    # Trim to last 50 points
     combined = combined[-50:]
     fm = fm[-50:]
     bn = bn[-50:]
@@ -30,15 +30,14 @@ def render_pnl_chart(pnl_history: dict) -> Panel:
                 asciichartpy.blue,
             ]},
         )
+        # Convert ANSI escape codes to Rich markup
+        content = Text.from_ansi(chart)
     except Exception:
-        chart = "No data yet"
+        content = Text("No data yet", style="dim")
 
-    legend = Text()
-    legend.append("━ Combined  ", style="green")
-    legend.append("━ 5M  ", style="yellow")
-    legend.append("━ BN", style="bright_blue")
-
-    content = Text(chart + "\n")
-    content.append(legend)
+    content.append("\n")
+    content.append("━ Combined  ", style="green")
+    content.append("━ 5M  ", style="yellow")
+    content.append("━ BN", style="bright_blue")
 
     return Panel(content, title="P&L OVER TIME (24h)", title_align="left", border_style="dim")
