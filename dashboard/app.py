@@ -26,6 +26,8 @@ from dashboard.panels.signals import render_signals
 from dashboard.panels.orderbook import render_orderbook
 from dashboard.panels.signal_hitrate import render_signal_hitrate
 from dashboard.panels.trades import render_trades
+from dashboard.panels.whales import render_whales
+from dashboard.panels.markets import render_markets
 
 BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
 
@@ -144,10 +146,11 @@ class DashboardApp:
         except Exception:
             self._live_state = None
 
-    def build_display(self) -> Layout:
-        layout = Layout()
+    def build_display(self):
+        """Build responsive layout that adjusts to terminal size."""
+        from rich.console import Group
 
-        # Fetch data
+        # Fetch live data every tick
         fm_stats = self.reader.get_fivemin_stats()
         bn_stats = self.reader.get_binance_stats()
         pb_stats = self.reader.get_polybot_stats()
@@ -155,13 +158,18 @@ class DashboardApp:
         trades = self.reader.get_recent_trades()
         window_remaining = self._get_window_remaining()
 
-        # Slow-refresh data (every 5 seconds)
-        if self._tick % 5 == 0:
-            self._cached_pnl = self.reader.get_pnl_history()
+        # Every 2 seconds: signals, orderbook
+        if self._tick % 2 == 0:
             self._cached_signals = self._get_signal_data()
             self._cached_orderbook, self._cached_ob_asset = self._get_orderbook_data()
 
-        # Very slow refresh (every 30 seconds)
+        # Every 5 seconds: P&L, whales, markets
+        if self._tick % 5 == 0:
+            self._cached_pnl = self.reader.get_pnl_history()
+            self._cached_whales = self.reader.get_whale_activity()
+            self._cached_markets = self.reader.get_active_markets()
+
+        # Every 30 seconds: daily, heatmap, hitrate
         if self._tick % 30 == 0:
             self._cached_daily = self.reader.get_daily_comparison()
             self._cached_hourly = self.reader.get_hourly_winrate()
@@ -171,6 +179,9 @@ class DashboardApp:
         signal_data = getattr(self, "_cached_signals", self._get_signal_data())
         ob_data = getattr(self, "_cached_orderbook", {"bids": [], "asks": []})
         ob_asset = getattr(self, "_cached_ob_asset", "BTC")
+        whales = getattr(self, "_cached_whales", [])
+        markets = getattr(self, "_cached_markets", [])
+
         daily = getattr(self, "_cached_daily", None)
         hourly = getattr(self, "_cached_hourly", None)
         hitrate = getattr(self, "_cached_hitrate", None)
@@ -183,53 +194,70 @@ class DashboardApp:
         if hitrate is None:
             hitrate = {"generated": 0, "skipped_price": 0, "skipped_risk": 0, "traded": 0, "won": 0}
 
-        # Build layout sections
-        sections = []
+        # Use Layout for responsive sizing
+        layout = Layout()
+
+        layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="cooldown", size=3 if cooldown["active"] else 0),
+            Layout(name="bot_stats", size=5),
+            Layout(name="charts", size=13),
+            Layout(name="analytics", size=10),
+            Layout(name="live_data", size=12),
+            Layout(name="trades", size=14),
+            Layout(name="footer", size=1),
+        )
 
         # Header
-        sections.append(render_header(self.start_time, self.caffeinate_pid))
+        layout["header"].update(render_header(self.start_time, self.caffeinate_pid))
 
-        # Cooldown banner
-        banner = render_cooldown_banner(cooldown)
-        if banner:
-            sections.append(banner)
+        # Cooldown
+        if cooldown["active"]:
+            banner = render_cooldown_banner(cooldown)
+            if banner:
+                layout["cooldown"].update(banner)
+            else:
+                layout["cooldown"].visible = False
+        else:
+            layout["cooldown"].visible = False
 
-        # Bot stats row
-        sections.append(Columns([
-            render_fivemin_stats(fm_stats, window_remaining),
-            render_binance_stats(bn_stats),
-            render_polybot_stats(pb_stats),
-        ], expand=True))
+        # Bot stats — 3 panels side by side
+        layout["bot_stats"].split_row(
+            Layout(render_fivemin_stats(fm_stats, window_remaining), ratio=2),
+            Layout(render_binance_stats(bn_stats), ratio=2),
+            Layout(render_polybot_stats(pb_stats), ratio=1),
+        )
 
-        # Charts row
-        sections.append(Columns([
-            render_pnl_chart(pnl),
-            render_price_chart(self.btc_candles),
-        ], expand=True))
+        # Charts — P&L + BTC price
+        layout["charts"].split_row(
+            Layout(render_pnl_chart(pnl), ratio=1),
+            Layout(render_price_chart(self.btc_candles), ratio=1),
+        )
 
-        # Daily + heatmap row
-        sections.append(Columns([
-            render_daily_comparison(daily),
-            render_hour_heatmap(hourly),
-        ], expand=True))
+        # Analytics — daily + heatmap + hitrate
+        layout["analytics"].split_row(
+            Layout(render_daily_comparison(daily), ratio=2),
+            Layout(render_hour_heatmap(hourly), ratio=2),
+            Layout(render_signal_hitrate(hitrate), ratio=1),
+        )
 
-        # Signals + orderbook + hitrate row
-        sections.append(Columns([
-            render_signals(signal_data),
-            render_orderbook(ob_data, ob_asset),
-            render_signal_hitrate(hitrate),
-        ], expand=True))
+        # Live data — signals + orderbook + whales + markets
+        layout["live_data"].split_row(
+            Layout(render_signals(signal_data), ratio=2),
+            Layout(render_orderbook(ob_data, ob_asset), ratio=1),
+            Layout(render_whales(whales), ratio=2),
+            Layout(render_markets(markets), ratio=2),
+        )
 
         # Trades
-        sections.append(render_trades(trades))
+        layout["trades"].update(render_trades(trades))
 
         # Footer
-        sections.append(render_footer(
+        layout["footer"].update(render_footer(
             self._get_prices(), self.caffeinate_pid, self._get_bots_running()
         ))
 
-        from rich.console import Group
-        return Group(*sections)
+        return layout
 
     async def fetch_candles_loop(self) -> None:
         while self.running:

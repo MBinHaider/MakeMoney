@@ -300,3 +300,62 @@ class DashboardDataReader:
         except Exception:
             empty = {"pnl": 0, "trades": 0, "win_rate": 0, "best": 0, "worst": 0}
             return {"today": empty, "yesterday": empty, "best": empty, "worst": empty}
+
+    def get_whale_activity(self, limit: int = 8) -> list[dict]:
+        """Get recent whale trades from PolyBot database."""
+        try:
+            conn = get_connection(self.pb_db)
+            rows = conn.execute(
+                """SELECT w.address, w.win_rate, w.total_trades,
+                          wt.market_slug, wt.side, wt.size, wt.timestamp
+                   FROM wallet_trades wt
+                   JOIN wallets w ON wt.wallet_address = w.address
+                   JOIN tracked_wallets tw ON w.address = tw.address
+                   ORDER BY wt.timestamp DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            conn.close()
+            return [
+                {
+                    "address": r["address"],
+                    "win_rate": r["win_rate"],
+                    "market": r["market_slug"] or "—",
+                    "side": r["side"],
+                    "size": r["size"],
+                    "timestamp": r["timestamp"],
+                }
+                for r in rows
+            ]
+        except Exception:
+            return []
+
+    def get_active_markets(self, limit: int = 6) -> list[dict]:
+        """Get active markets being tracked by PolyBot."""
+        try:
+            conn = get_connection(self.pb_db)
+            rows = conn.execute(
+                """SELECT m.question, m.price_yes, m.price_no, m.volume,
+                          COALESCE(s.total_score, 0) as signal_score
+                   FROM markets m
+                   LEFT JOIN (
+                       SELECT market_id, total_score
+                       FROM signals
+                       WHERE id IN (SELECT MAX(id) FROM signals GROUP BY market_id)
+                   ) s ON m.condition_id = s.market_id
+                   WHERE m.active = 1
+                   ORDER BY m.volume DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            conn.close()
+            return [
+                {
+                    "question": r["question"],
+                    "price_yes": r["price_yes"],
+                    "price_no": r["price_no"],
+                    "volume": r["volume"],
+                    "signal_score": r["signal_score"],
+                }
+                for r in rows
+            ]
+        except Exception:
+            return []
