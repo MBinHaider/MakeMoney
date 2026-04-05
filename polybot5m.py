@@ -139,8 +139,13 @@ class PolyBot5M:
                     await asyncio.sleep(1)
                     continue
 
+                # Position sizing: $5 for 3/3 agreement, $3 for 2/3
+                agreeing = sum(1 for v in best.indicators.values()
+                               if isinstance(v, dict) and v.get("direction") == best.direction)
+                trade_amount = min(can_trade["max_amount"], 5.0 if agreeing >= 3 else 3.0)
+
                 # Execute trade
-                result = self.executor.execute(best, can_trade["max_amount"], ask_price)
+                result = self.executor.execute(best, trade_amount, ask_price)
                 if result["status"] == "filled":
                     self._traded_this_window = True
                     signal_info = {
