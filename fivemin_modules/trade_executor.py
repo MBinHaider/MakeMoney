@@ -61,14 +61,9 @@ class FiveMinTradeExecutor:
         }
 
     def _init_clob_client(self):
-        """Initialize py-clob-client with SOCKS5 proxy for live trading."""
+        """Initialize py-clob-client for live trading (no proxy needed for API)."""
         if self._clob_client is not None:
             return
-
-        import socks
-        import socket
-        socks.set_default_proxy(socks.SOCKS5, '127.0.0.1', 40000)
-        socket.socket = socks.socksocket
 
         from py_clob_client.client import ClobClient
 

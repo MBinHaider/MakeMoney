@@ -132,14 +132,12 @@ class FiveMinMarketData:
             state.window_open_price = close
 
     async def fetch_orderbooks(self, exchange=None) -> None:
-        """Fetch orderbooks directly from Polymarket CLOB API via SOCKS5 proxy.
-        Retries up to 3 times if proxy connection fails."""
-        from aiohttp_socks import ProxyConnector
+        """Fetch orderbooks directly from Polymarket CLOB API.
+        Uses direct connection (no proxy needed for API)."""
 
         for attempt in range(3):
             try:
-                connector = ProxyConnector.from_url(self.config.PROXY_URL)
-                async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=10)) as session:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                     for asset in self.config.FIVEMIN_ASSETS:
                         state = self.states.get(asset)
                         if state is None:
