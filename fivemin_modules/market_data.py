@@ -40,6 +40,9 @@ class MarketState:
     orderbook_down: dict = field(default_factory=lambda: {"bids": [], "asks": []})
     volumes: deque = field(default_factory=lambda: deque(maxlen=60))
     price_history: deque = field(default_factory=lambda: deque(maxlen=60))
+    token_id_up: str = ""
+    token_id_down: str = ""
+    condition_id: str = ""
 
     def reset(self, new_window_ts: int) -> None:
         """Reset state for a new 5-min window."""
@@ -50,6 +53,9 @@ class MarketState:
         self.orderbook_down = {"bids": [], "asks": []}
         self.volumes = deque(maxlen=60)
         self.price_history = deque(maxlen=60)
+        self.token_id_up = ""
+        self.token_id_down = ""
+        self.condition_id = ""
 
     def to_signal_dict(self) -> dict:
         """Convert to dict for signal engine evaluation."""
@@ -143,6 +149,10 @@ class FiveMinMarketData:
                         token_ids = await self._fetch_token_ids(session, slug)
                         if not token_ids:
                             continue
+
+                        # Store token IDs on state for live trading
+                        state.token_id_up = token_ids.get("UP", "")
+                        state.token_id_down = token_ids.get("DOWN", "")
 
                         # Fetch orderbooks for UP and DOWN tokens
                         for label, token_id in token_ids.items():

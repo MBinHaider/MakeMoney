@@ -29,9 +29,9 @@ class PolyBot5M:
         self.market_data = FiveMinMarketData(config)
         self.signal_engine = FiveMinSignalEngine(config)
         self.risk_manager = FiveMinRiskManager(config)
-        self.executor = FiveMinTradeExecutor(config)
         self.notifier = FiveMinNotifier(config)
         self.exchange = None
+        self.executor = None  # initialized after exchange setup
         self._traded_this_window = False
 
     async def startup(self) -> None:
@@ -39,17 +39,24 @@ class PolyBot5M:
         init_fivemin_db(self.config.FIVEMIN_DB_PATH)
         self.risk_manager.init_portfolio(self.config.FIVEMIN_STARTING_BALANCE)
 
-        # Init PMXT exchange
-        try:
-            import pmxt
-            self.exchange = pmxt.Polymarket({
-                "privateKey": self.config.PRIVATE_KEY,
-                "proxyAddress": self.config.POLYMARKET_PROXY_ADDRESS,
-            })
-            log.info("PMXT exchange connected")
-        except Exception as e:
-            log.warning(f"PMXT init failed (paper mode will simulate): {e}")
+        # Init PMXT exchange (needed for live trading)
+        if self.config.FIVEMIN_TRADING_MODE == "live":
+            try:
+                import pmxt
+                self.exchange = pmxt.Polymarket({
+                    "privateKey": self.config.PRIVATE_KEY,
+                    "proxyAddress": self.config.POLYMARKET_PROXY_ADDRESS,
+                })
+                log.info("PMXT exchange connected (LIVE MODE)")
+            except Exception as e:
+                log.error(f"PMXT init failed — cannot trade live: {e}")
+                log.info("Falling back to paper mode")
+                self.config.FIVEMIN_TRADING_MODE = "paper"
+                self.exchange = None
+        else:
             self.exchange = None
+
+        self.executor = FiveMinTradeExecutor(self.config, self.exchange)
 
         # Init market states
         window_ts = compute_window_ts(int(time.time()))
@@ -170,8 +177,14 @@ class PolyBot5M:
                                if isinstance(v, dict) and v.get("direction") == best.direction)
                 trade_amount = min(can_trade["max_amount"], 5.0 if agreeing >= 3 else 3.0)
 
+                # Get token ID for live trading
+                state = self.market_data.states.get(best.asset)
+                token_id = ""
+                if state:
+                    token_id = state.token_id_up if best.direction == "UP" else state.token_id_down
+
                 # Execute trade
-                result = self.executor.execute(best, trade_amount, ask_price)
+                result = self.executor.execute(best, trade_amount, ask_price, token_id=token_id)
                 if result["status"] == "filled":
                     self._traded_this_window = True
                     signal_info = {
