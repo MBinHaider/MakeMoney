@@ -133,6 +133,12 @@ class PolyBot5M:
                     await asyncio.sleep(1)
                     continue
 
+                # Price filter: skip if ask > $0.70 (bad risk/reward) or < $0.05 (no liquidity)
+                if ask_price > 0.70 or ask_price < 0.05:
+                    log.info(f"Skipping {best.asset} {best.direction}: ask ${ask_price:.2f} outside range [$0.05-$0.70]")
+                    await asyncio.sleep(1)
+                    continue
+
                 # Execute trade
                 result = self.executor.execute(best, can_trade["max_amount"], ask_price)
                 if result["status"] == "filled":
