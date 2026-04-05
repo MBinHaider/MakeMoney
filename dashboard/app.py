@@ -1,10 +1,12 @@
 import asyncio
+import json
 import time
 import os
 import signal
 import subprocess
 from datetime import datetime, timezone
 
+import aiohttp
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
@@ -25,6 +27,8 @@ from dashboard.panels.orderbook import render_orderbook
 from dashboard.panels.signal_hitrate import render_signal_hitrate
 from dashboard.panels.trades import render_trades
 
+BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
+
 
 class DashboardApp:
     def __init__(self, config: Config):
@@ -37,6 +41,9 @@ class DashboardApp:
         self.running = False
         self.btc_candles = []
         self._tick = 0
+        self._live_prices = {"BTC": 0.0, "ETH": 0.0, "SOL": 0.0}
+        self._prev_prices = {"BTC": 0.0, "ETH": 0.0, "SOL": 0.0}
+        self._live_state = None
 
     def start_caffeinate(self) -> None:
         try:
@@ -63,20 +70,39 @@ class DashboardApp:
         return window_end - now
 
     def _get_prices(self) -> dict:
-        if self.btc_candles:
-            btc = self.btc_candles[-1]["close"]
-        else:
-            btc = 0
         return {
-            "BTC": {"value": btc, "change": 0},
-            "ETH": {"value": 0, "change": 0},
-            "SOL": {"value": 0, "change": 0},
+            "BTC": {"value": self._live_prices["BTC"], "change": self._live_prices["BTC"] - self._prev_prices["BTC"]},
+            "ETH": {"value": self._live_prices["ETH"], "change": self._live_prices["ETH"] - self._prev_prices["ETH"]},
+            "SOL": {"value": self._live_prices["SOL"], "change": self._live_prices["SOL"] - self._prev_prices["SOL"]},
         }
 
     def _get_bots_running(self) -> dict:
-        return {"5M": True, "BN": True, "POLY": True}
+        result = {"5M": False, "BN": False, "POLY": False}
+        try:
+            import psutil
+            for proc in psutil.process_iter(["cmdline"]):
+                try:
+                    cmd = " ".join(proc.info.get("cmdline") or [])
+                    if "polybot5m" in cmd:
+                        result["5M"] = True
+                    elif "binancebot" in cmd:
+                        result["BN"] = True
+                    elif "polybot.py" in cmd and "polybot5m" not in cmd:
+                        result["POLY"] = True
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception:
+            pass
+        return result
 
     def _get_signal_data(self) -> list[dict]:
+        state = self._live_state
+        if state:
+            return state.get("signals", [
+                {"asset": "BTC", "momentum": "", "orderbook": "", "volume": "", "signal": "", "confidence": 0},
+                {"asset": "ETH", "momentum": "", "orderbook": "", "volume": "", "signal": "", "confidence": 0},
+                {"asset": "SOL", "momentum": "", "orderbook": "", "volume": "", "signal": "", "confidence": 0},
+            ])
         return [
             {"asset": "BTC", "momentum": "", "orderbook": "", "volume": "", "signal": "", "confidence": 0},
             {"asset": "ETH", "momentum": "", "orderbook": "", "volume": "", "signal": "", "confidence": 0},
@@ -84,7 +110,39 @@ class DashboardApp:
         ]
 
     def _get_orderbook_data(self) -> tuple[dict, str]:
+        state = self._live_state
+        if state and state.get("orderbook"):
+            return state["orderbook"], state.get("orderbook_asset", "BTC")
         return {"bids": [], "asks": []}, "BTC"
+
+    async def _fetch_live_prices(self) -> None:
+        """Fetch live prices from Binance REST API."""
+        symbols = {"BTCUSDT": "BTC", "ETHUSDT": "ETH", "SOLUSDT": "SOL"}
+        try:
+            async with aiohttp.ClientSession() as session:
+                for symbol, asset in symbols.items():
+                    async with session.get(BINANCE_PRICE_URL, params={"symbol": symbol}) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            price = float(data["price"])
+                            self._prev_prices[asset] = self._live_prices[asset]
+                            self._live_prices[asset] = price
+        except Exception:
+            pass
+
+    def _read_bot_state(self) -> None:
+        """Read PolyBot 5M state file if it exists."""
+        state_path = os.path.join(os.path.dirname(self.config.FIVEMIN_DB_PATH), "polybot5m_state.json")
+        try:
+            if os.path.exists(state_path):
+                mtime = os.path.getmtime(state_path)
+                if time.time() - mtime < 10:  # Only use if updated within 10s
+                    with open(state_path) as f:
+                        self._live_state = json.load(f)
+                else:
+                    self._live_state = None
+        except Exception:
+            self._live_state = None
 
     def build_display(self) -> Layout:
         layout = Layout()
@@ -175,24 +233,34 @@ class DashboardApp:
 
     async def fetch_candles_loop(self) -> None:
         while self.running:
-            self.btc_candles = await fetch_btc_candles()
-            # Update prices from candles
+            try:
+                self.btc_candles = await fetch_btc_candles()
+            except Exception:
+                pass
             await asyncio.sleep(60)
+
+    async def fetch_prices_loop(self) -> None:
+        while self.running:
+            await self._fetch_live_prices()
+            self._read_bot_state()
+            await asyncio.sleep(2)
 
     async def run(self) -> None:
         self.start_caffeinate()
         self.running = True
 
-        # Fetch initial candles
+        # Fetch initial data
         try:
             self.btc_candles = await fetch_btc_candles()
         except Exception:
             self.btc_candles = []
+        await self._fetch_live_prices()
 
         console = Console()
 
-        # Start candle fetcher in background
+        # Start background fetchers
         candle_task = asyncio.create_task(self.fetch_candles_loop())
+        price_task = asyncio.create_task(self.fetch_prices_loop())
 
         try:
             with Live(console=console, refresh_per_second=1, screen=True, auto_refresh=False) as live:
@@ -209,4 +277,5 @@ class DashboardApp:
         finally:
             self.running = False
             candle_task.cancel()
+            price_task.cancel()
             self.stop_caffeinate()

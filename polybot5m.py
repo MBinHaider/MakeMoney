@@ -1,5 +1,7 @@
 import asyncio
 import argparse
+import json
+import os
 import signal
 import sys
 import time
@@ -90,16 +92,40 @@ class PolyBot5M:
 
                 # Evaluate signals for each asset
                 signals = []
+                signal_display = []
                 for asset in self.config.FIVEMIN_ASSETS:
                     state = self.market_data.states.get(asset)
                     if state is None or state.current_price == 0:
+                        signal_display.append({"asset": asset, "momentum": "", "orderbook": "", "volume": "", "signal": "", "confidence": 0})
                         continue
-                    sig = self.signal_engine.evaluate(
-                        asset, state.to_signal_dict(), seconds_elapsed
-                    )
+
+                    sd = state.to_signal_dict()
+                    sig = self.signal_engine.evaluate(asset, sd, seconds_elapsed)
+
+                    # Build display data from indicators
+                    from fivemin_modules.indicators import calc_momentum, calc_orderbook_imbalance, calc_volume_spike
+                    mom = calc_momentum(sd["current_price"], sd["window_open_price"])
+                    imb = calc_orderbook_imbalance(sd["orderbook_up"], sd["orderbook_down"])
+                    pd_val = (sd["current_price"] - sd["window_open_price"]) / sd["window_open_price"] if sd["window_open_price"] > 0 else 0
+                    vol = calc_volume_spike(sd["volumes"], pd_val)
+
+                    entry = {
+                        "asset": asset,
+                        "momentum": mom.direction,
+                        "orderbook": imb.direction,
+                        "volume": vol.direction,
+                        "signal": sig.direction if sig else "",
+                        "agree_count": sum(1 for i in [mom, imb, vol] if sig and i.direction == sig.direction) if sig else 0,
+                        "confidence": sig.confidence if sig else 0,
+                    }
+                    signal_display.append(entry)
+
                     if sig is not None:
                         sig.timestamp = float(current_window)
                         signals.append(sig)
+
+                # Write state file for dashboard
+                self._write_state(signal_display)
 
                 # Pick best signal
                 best = self.signal_engine.select_best(signals)
@@ -193,6 +219,37 @@ class PolyBot5M:
         await self.notifier.send_message(
             self.notifier.format_settlement(result, status)
         )
+
+    def _write_state(self, signal_display: list[dict]) -> None:
+        """Write current state to JSON file for dashboard to read."""
+        try:
+            # Find best signal's orderbook
+            best_asset = "BTC"
+            best_ob = {"bids": [], "asks": []}
+            best_conf = 0
+            for s in signal_display:
+                if s.get("confidence", 0) > best_conf:
+                    best_conf = s["confidence"]
+                    best_asset = s["asset"]
+
+            state = self.market_data.states.get(best_asset)
+            if state:
+                best_ob = {
+                    "bids": [(p, s) for p, s in state.orderbook_up.get("bids", [])[:5]],
+                    "asks": [(p, s) for p, s in state.orderbook_up.get("asks", [])[:5]],
+                }
+
+            state_data = {
+                "signals": signal_display,
+                "orderbook": best_ob,
+                "orderbook_asset": best_asset,
+                "timestamp": time.time(),
+            }
+            state_path = os.path.join(os.path.dirname(self.config.FIVEMIN_DB_PATH), "polybot5m_state.json")
+            with open(state_path, "w") as f:
+                json.dump(state_data, f)
+        except Exception:
+            pass
 
     def _get_ask_price(self, asset: str, direction: str) -> float:
         """Get the best ask price for the given direction from orderbook."""
