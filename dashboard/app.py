@@ -19,7 +19,7 @@ from rich.columns import Columns
 from config import Config
 from dashboard.data_reader import DashboardDataReader
 
-BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_PRICE_URL = os.environ.get("BINANCE_API_URL", "https://data-api.binance.vision") + "/api/v3/ticker/price"
 
 
 class DashboardApp:
