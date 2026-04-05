@@ -85,8 +85,8 @@ class PolyBot5M:
                     continue
 
                 # Fetch orderbooks periodically (every ~5s)
-                if int(seconds_elapsed) % 5 == 0 and self.exchange:
-                    await self.market_data.fetch_orderbooks(self.exchange)
+                if int(seconds_elapsed) % 5 == 0:
+                    await self.market_data.fetch_orderbooks()
 
                 # Evaluate signals for each asset
                 signals = []

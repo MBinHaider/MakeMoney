@@ -125,47 +125,100 @@ class FiveMinMarketData:
         if state.window_open_price == 0.0 and close > 0:
             state.window_open_price = close
 
-    async def fetch_orderbooks(self, exchange) -> None:
-        """Fetch orderbooks from PMXT for all assets in the current window."""
-        for asset in self.config.FIVEMIN_ASSETS:
-            state = self.states.get(asset)
-            if state is None:
-                continue
-            slug = compute_market_slug(asset, state.window_ts)
-            try:
-                markets = await asyncio.to_thread(
-                    exchange.fetch_markets, {"slug": slug}
-                )
-                if not markets:
-                    log.warning(f"No market found for {slug}")
-                    continue
+    async def fetch_orderbooks(self, exchange=None) -> None:
+        """Fetch orderbooks directly from Polymarket CLOB API via SOCKS5 proxy."""
+        from aiohttp_socks import ProxyConnector
 
-                market = markets[0]
-                outcomes = market.get("outcomes", [])
-                for outcome in outcomes:
-                    label = outcome.get("label", "").upper()
-                    outcome_id = outcome.get("outcomeId", "")
-                    if not outcome_id:
+        connector = ProxyConnector.from_url(self.config.PROXY_URL)
+        try:
+            async with aiohttp.ClientSession(connector=connector) as session:
+                for asset in self.config.FIVEMIN_ASSETS:
+                    state = self.states.get(asset)
+                    if state is None:
                         continue
-                    try:
-                        book = await asyncio.to_thread(
-                            exchange.fetch_order_book, outcome_id
-                        )
-                        parsed = self._parse_orderbook(book)
-                        if label == "UP":
-                            state.orderbook_up = parsed
-                        elif label == "DOWN":
-                            state.orderbook_down = parsed
-                    except Exception as e:
-                        log.error(f"Orderbook error {asset} {label}: {e}")
-            except Exception as e:
-                log.error(f"Market fetch error {slug}: {e}")
 
-    def _parse_orderbook(self, book: dict) -> dict:
-        """Parse PMXT orderbook into {bids: [(price, size)], asks: [(price, size)]}."""
-        bids = [(float(b[0]), float(b[1])) for b in book.get("bids", [])[:5]]
-        asks = [(float(a[0]), float(a[1])) for a in book.get("asks", [])[:5]]
-        return {"bids": bids, "asks": asks}
+                    # Find the current market via Gamma API
+                    slug = compute_market_slug(asset, state.window_ts)
+                    try:
+                        token_ids = await self._fetch_token_ids(session, slug)
+                        if not token_ids:
+                            continue
+
+                        # Fetch orderbooks for UP and DOWN tokens
+                        for label, token_id in token_ids.items():
+                            book = await self._fetch_clob_orderbook(session, token_id)
+                            if label == "UP":
+                                state.orderbook_up = book
+                            elif label == "DOWN":
+                                state.orderbook_down = book
+                    except Exception as e:
+                        log.error(f"Orderbook error {asset}: {e}")
+        except Exception as e:
+            log.error(f"Proxy connection error: {e}")
+
+    async def _fetch_token_ids(self, session: aiohttp.ClientSession, slug: str) -> dict:
+        """Fetch UP/DOWN token IDs from Gamma API for a market slug."""
+        url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return {}
+                events = await resp.json()
+                if not events:
+                    return {}
+
+                # Parse outcomes from the event's markets
+                event = events[0]
+                markets = event.get("markets", [])
+                token_ids = {}
+                for market in markets:
+                    tokens = market.get("tokens", [])
+                    if not tokens:
+                        # Try parsing from clobTokenIds string
+                        outcomes_str = market.get("outcomes", "[]")
+                        clob_str = market.get("clobTokenIds", "[]")
+                        try:
+                            import json as _json
+                            outcomes = _json.loads(outcomes_str) if isinstance(outcomes_str, str) else outcomes_str
+                            clob_ids = _json.loads(clob_str) if isinstance(clob_str, str) else clob_str
+                            for outcome, tid in zip(outcomes, clob_ids):
+                                label = outcome.upper()
+                                if label in ("UP", "YES"):
+                                    token_ids["UP"] = tid
+                                elif label in ("DOWN", "NO"):
+                                    token_ids["DOWN"] = tid
+                        except Exception:
+                            pass
+                    else:
+                        for token in tokens:
+                            outcome = token.get("outcome", "").upper()
+                            tid = token.get("token_id", "")
+                            if outcome in ("UP", "YES"):
+                                token_ids["UP"] = tid
+                            elif outcome in ("DOWN", "NO"):
+                                token_ids["DOWN"] = tid
+
+                if token_ids:
+                    log.info(f"Found tokens for {slug}: {list(token_ids.keys())}")
+                return token_ids
+        except Exception as e:
+            log.warning(f"Gamma API error for {slug}: {e}")
+            return {}
+
+    async def _fetch_clob_orderbook(self, session: aiohttp.ClientSession, token_id: str) -> dict:
+        """Fetch orderbook from Polymarket CLOB API for a token."""
+        url = f"https://clob.polymarket.com/book?token_id={token_id}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return {"bids": [], "asks": []}
+                data = await resp.json()
+                bids = [(float(b["price"]), float(b["size"])) for b in data.get("bids", [])[:5]]
+                asks = [(float(a["price"]), float(a["size"])) for a in data.get("asks", [])[:5]]
+                return {"bids": bids, "asks": asks}
+        except Exception as e:
+            log.warning(f"CLOB orderbook error: {e}")
+            return {"bids": [], "asks": []}
 
     def stop(self) -> None:
         self._running = False
