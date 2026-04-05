@@ -132,39 +132,49 @@ class FiveMinMarketData:
             state.window_open_price = close
 
     async def fetch_orderbooks(self, exchange=None) -> None:
-        """Fetch orderbooks directly from Polymarket CLOB API via SOCKS5 proxy."""
+        """Fetch orderbooks directly from Polymarket CLOB API via SOCKS5 proxy.
+        Retries up to 3 times if proxy connection fails."""
         from aiohttp_socks import ProxyConnector
 
-        connector = ProxyConnector.from_url(self.config.PROXY_URL)
-        try:
-            async with aiohttp.ClientSession(connector=connector) as session:
-                for asset in self.config.FIVEMIN_ASSETS:
-                    state = self.states.get(asset)
-                    if state is None:
-                        continue
-
-                    # Find the current market via Gamma API
-                    slug = compute_market_slug(asset, state.window_ts)
-                    try:
-                        token_ids = await self._fetch_token_ids(session, slug)
-                        if not token_ids:
+        for attempt in range(3):
+            try:
+                connector = ProxyConnector.from_url(self.config.PROXY_URL)
+                async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=10)) as session:
+                    for asset in self.config.FIVEMIN_ASSETS:
+                        state = self.states.get(asset)
+                        if state is None:
                             continue
 
-                        # Store token IDs on state for live trading
-                        state.token_id_up = token_ids.get("UP", "")
-                        state.token_id_down = token_ids.get("DOWN", "")
+                        # Only fetch token IDs if we don't have them for this window
+                        if not state.token_id_up or not state.token_id_down:
+                            slug = compute_market_slug(asset, state.window_ts)
+                            try:
+                                token_ids = await self._fetch_token_ids(session, slug)
+                                if token_ids:
+                                    state.token_id_up = token_ids.get("UP", "")
+                                    state.token_id_down = token_ids.get("DOWN", "")
+                                    log.info(f"Got token IDs for {asset}: UP={state.token_id_up[:20]}...")
+                            except Exception as e:
+                                log.warning(f"Token ID fetch failed {asset}: {e}")
 
-                        # Fetch orderbooks for UP and DOWN tokens
-                        for label, token_id in token_ids.items():
-                            book = await self._fetch_clob_orderbook(session, token_id)
-                            if label == "UP":
-                                state.orderbook_up = book
-                            elif label == "DOWN":
-                                state.orderbook_down = book
-                    except Exception as e:
-                        log.error(f"Orderbook error {asset}: {e}")
-        except Exception as e:
-            log.error(f"Proxy connection error: {e}")
+                        # Fetch orderbooks if we have token IDs
+                        if state.token_id_up:
+                            try:
+                                state.orderbook_up = await self._fetch_clob_orderbook(session, state.token_id_up)
+                            except Exception:
+                                pass
+                        if state.token_id_down:
+                            try:
+                                state.orderbook_down = await self._fetch_clob_orderbook(session, state.token_id_down)
+                            except Exception:
+                                pass
+                return  # Success, no retry needed
+            except Exception as e:
+                if attempt < 2:
+                    log.warning(f"Proxy attempt {attempt+1}/3 failed, retrying in 2s...")
+                    await asyncio.sleep(2)
+                else:
+                    log.error(f"Proxy connection failed after 3 attempts: {e}")
 
     async def _fetch_token_ids(self, session: aiohttp.ClientSession, slug: str) -> dict:
         """Fetch UP/DOWN token IDs from Gamma API for a market slug."""
