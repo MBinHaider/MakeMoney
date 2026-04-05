@@ -14,6 +14,7 @@ class FiveMinTradeExecutor:
         self.config = config
         self.db_path = config.FIVEMIN_DB_PATH
         self.exchange = exchange
+        self._clob_client = None
 
     def execute(self, signal: Signal, amount: float, ask_price: float,
                 token_id: str = "", condition_id: str = "") -> dict:
@@ -59,55 +60,85 @@ class FiveMinTradeExecutor:
             "cost": amount,
         }
 
+    def _init_clob_client(self):
+        """Initialize py-clob-client with SOCKS5 proxy for live trading."""
+        if self._clob_client is not None:
+            return
+
+        import socks
+        import socket
+        socks.set_default_proxy(socks.SOCKS5, '127.0.0.1', 40000)
+        socket.socket = socks.socksocket
+
+        from py_clob_client.client import ClobClient
+
+        self._clob_client = ClobClient(
+            'https://clob.polymarket.com',
+            key=self.config.PRIVATE_KEY,
+            chain_id=137,
+            signature_type=1,  # POLY_GNOSIS_SAFE
+            funder=self.config.POLYMARKET_PROXY_ADDRESS,
+        )
+        creds = self._clob_client.derive_api_key()
+        self._clob_client.set_api_creds(creds)
+        log.info("LIVE: py-clob-client authenticated")
+
     def _execute_live(self, signal: Signal, amount: float, ask_price: float,
                       token_id: str, condition_id: str) -> dict:
-        """Place a real order on Polymarket via PMXT."""
-        if not self.exchange:
-            log.error("LIVE: No exchange connection")
-            return {"status": "error", "reason": "No exchange connection"}
-
+        """Place a real order on Polymarket via py-clob-client."""
         if not token_id:
             log.error("LIVE: No token ID for order")
             return {"status": "error", "reason": "No token ID"}
+
+        try:
+            self._init_clob_client()
+        except Exception as e:
+            log.error(f"LIVE: Auth failed: {e}")
+            return {"status": "error", "reason": f"Auth failed: {e}"}
 
         shares = amount / ask_price
         now = datetime.now(timezone.utc).isoformat()
 
         try:
-            # Place limit order at ask price
+            from py_clob_client.clob_types import OrderArgs
+            from py_clob_client.order_builder.constants import BUY
+
             log.info(f"LIVE PLACING ORDER: BUY {signal.direction} {signal.asset} "
-                     f"{shares:.2f} shares @ ${ask_price:.4f}")
+                     f"{shares:.2f} shares @ ${ask_price:.4f} token={token_id[:20]}...")
 
-            order = self.exchange.create_order(
-                outcome_id=token_id,
-                side="buy",
-                type="limit",
-                amount=shares,
+            # Build and sign the order
+            order_args = OrderArgs(
                 price=ask_price,
+                size=shares,
+                side=BUY,
+                token_id=token_id,
             )
+            signed_order = self._clob_client.create_order(order_args)
+            resp = self._clob_client.post_order(signed_order)
 
-            order_id = order.id if hasattr(order, 'id') else str(order)
-            filled = order.filled if hasattr(order, 'filled') else shares
-            status = order.status if hasattr(order, 'status') else "submitted"
-
-            log.info(f"LIVE ORDER {order_id}: status={status} filled={filled}")
+            order_id = resp.get("orderID", resp.get("id", str(resp)))
+            log.info(f"LIVE ORDER SUBMITTED: {order_id}")
 
             # Wait briefly for fill
-            if status not in ("filled", "matched"):
-                import time
-                time.sleep(3)
-                try:
-                    updated = self.exchange.fetch_order(order_id)
-                    status = updated.status if hasattr(updated, 'status') else status
-                    filled = updated.filled if hasattr(updated, 'filled') else filled
-                except Exception as e:
-                    log.warning(f"Could not check order status: {e}")
+            import time
+            time.sleep(3)
 
-            # If not filled, cancel
-            if status not in ("filled", "matched") and filled == 0:
+            # Check if filled
+            try:
+                order_status = self._clob_client.get_order(order_id)
+                filled = float(order_status.get("size_matched", 0))
+                status = order_status.get("status", "unknown")
+                log.info(f"LIVE ORDER STATUS: {status} filled={filled}")
+            except Exception as e:
+                log.warning(f"Could not check order: {e}")
+                filled = shares  # Assume filled if can't check
+                status = "assumed_filled"
+
+            # If not filled at all, cancel
+            if filled == 0 and status not in ("MATCHED", "FILLED"):
                 try:
-                    self.exchange.cancel_order(order_id)
-                    log.info(f"LIVE ORDER CANCELLED (not filled): {order_id}")
+                    self._clob_client.cancel(order_id)
+                    log.info(f"LIVE ORDER CANCELLED: {order_id}")
                 except Exception:
                     pass
                 return {"status": "error", "reason": "Order not filled"}
@@ -124,7 +155,7 @@ class FiveMinTradeExecutor:
                    VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
                 (signal.asset, signal.direction, ask_price, actual_shares, actual_cost,
                  int(signal.timestamp), signal.confidence, signal.phase,
-                 json.dumps({"order_id": order_id, **signal.indicators}), now),
+                 json.dumps({"order_id": order_id}), now),
             )
             trade_id = cursor.lastrowid
             conn.commit()
@@ -132,8 +163,7 @@ class FiveMinTradeExecutor:
 
             log.info(
                 f"LIVE FILLED: BUY {signal.direction} {signal.asset} "
-                f"{actual_shares:.2f} shares @ ${ask_price} (${actual_cost:.2f}) "
-                f"order={order_id}"
+                f"{actual_shares:.2f} shares @ ${ask_price} (${actual_cost:.2f})"
             )
 
             return {
