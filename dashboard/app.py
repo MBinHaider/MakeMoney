@@ -182,19 +182,27 @@ class DashboardApp:
     async def run(self) -> None:
         self.start_caffeinate()
         self.running = True
-        self.btc_candles = await fetch_btc_candles()
+
+        # Fetch initial candles
+        try:
+            self.btc_candles = await fetch_btc_candles()
+        except Exception:
+            self.btc_candles = []
 
         console = Console()
 
-        # Start candle fetcher
+        # Start candle fetcher in background
         candle_task = asyncio.create_task(self.fetch_candles_loop())
 
         try:
-            with Live(console=console, refresh_per_second=1, screen=True) as live:
+            with Live(console=console, refresh_per_second=1, screen=True, auto_refresh=False) as live:
                 while self.running:
                     self._tick += 1
-                    display = self.build_display()
-                    live.update(display)
+                    try:
+                        display = self.build_display()
+                        live.update(display, refresh=True)
+                    except Exception as e:
+                        live.update(f"[red]Render error: {e}[/]", refresh=True)
                     await asyncio.sleep(1)
         except KeyboardInterrupt:
             pass
