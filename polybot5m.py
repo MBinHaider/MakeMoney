@@ -62,7 +62,8 @@ class PolyBot5M:
         window_ts = compute_window_ts(int(time.time()))
         self.market_data.init_states(window_ts)
 
-        await self.notifier.send_message(
+        # Startup message — only log, don't spam Telegram
+        log.info(
             self.notifier.format_startup(
                 self.config.FIVEMIN_TRADING_MODE,
                 self.config.FIVEMIN_STARTING_BALANCE,
@@ -144,18 +145,6 @@ class PolyBot5M:
                 can_trade = self.risk_manager.can_trade()
                 if not can_trade["approved"]:
                     log.info(f"Trade blocked: {can_trade['reason']}")
-                    if "consecutive" in can_trade["reason"].lower() or "cooldown" in can_trade["reason"].lower():
-                        await self.notifier.send_message(
-                            self.notifier.format_cooldown(
-                                self.config.FIVEMIN_COOLDOWN_LOSSES,
-                                self.config.FIVEMIN_COOLDOWN_MINUTES,
-                            )
-                        )
-                    elif "daily" in can_trade["reason"].lower():
-                        status = self.risk_manager.get_status()
-                        await self.notifier.send_message(
-                            self.notifier.format_daily_limit(-status["daily_pnl"])
-                        )
                     await asyncio.sleep(1)
                     continue
 
@@ -303,7 +292,7 @@ class PolyBot5M:
             log.info("Tasks cancelled")
         finally:
             if self.notifier:
-                await self.notifier.send_message(self.notifier.format_shutdown())
+                log.info("PolyBot 5M shutdown")
             log.info("PolyBot 5M stopped")
 
 
