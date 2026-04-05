@@ -19,6 +19,10 @@ class DashboardDataReader:
                 return self._empty_fivemin_stats()
             p = dict(row)
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+            # Detect actual mode from running bot process
+            mode = self._detect_fivemin_mode()
+
             return {
                 "balance": p["balance"],
                 "starting_balance": p["starting_balance"],
@@ -30,10 +34,27 @@ class DashboardDataReader:
                 "daily_pnl": p["daily_pnl"] if p["daily_pnl_date"] == today else 0.0,
                 "is_paused": bool(p["is_paused"]),
                 "pause_until": p["pause_until"],
-                "mode": self.config.FIVEMIN_TRADING_MODE,
+                "mode": mode,
             }
         except Exception:
             return self._empty_fivemin_stats()
+
+    def _detect_fivemin_mode(self) -> str:
+        """Check if polybot5m is running in live or paper mode."""
+        try:
+            import psutil
+            for proc in psutil.process_iter(["cmdline"]):
+                try:
+                    cmd = " ".join(proc.info.get("cmdline") or [])
+                    if "polybot5m" in cmd and "--mode" in cmd and "live" in cmd:
+                        return "live"
+                    elif "polybot5m" in cmd:
+                        return "paper"
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception:
+            pass
+        return self.config.FIVEMIN_TRADING_MODE
 
     def _empty_fivemin_stats(self) -> dict:
         return {
