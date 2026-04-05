@@ -134,7 +134,7 @@ class FiveMinMarketData:
             slug = compute_market_slug(asset, state.window_ts)
             try:
                 markets = await asyncio.to_thread(
-                    exchange.fetchMarkets, {"slug": slug}
+                    exchange.fetch_markets, {"slug": slug}
                 )
                 if not markets:
                     log.warning(f"No market found for {slug}")
@@ -149,7 +149,7 @@ class FiveMinMarketData:
                         continue
                     try:
                         book = await asyncio.to_thread(
-                            exchange.fetchOrderBook, outcome_id
+                            exchange.fetch_order_book, outcome_id
                         )
                         parsed = self._parse_orderbook(book)
                         if label == "UP":
