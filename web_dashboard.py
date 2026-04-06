@@ -1,7 +1,7 @@
 """
-web_dashboard.py — MBH Trading Bots Web Dashboard
-Flask + Socket.IO WebSocket dashboard that mirrors the terminal Rich dashboard.
-Serves on 0.0.0.0:8080 and pushes all data every second via WebSocket.
+web_dashboard.py — MBH Trading Bots Web Dashboard V2
+Flask + Socket.IO WebSocket dashboard with responsive layout, fixed charts,
+live/paper mode toggle, paper vs real comparison, and wallet balance display.
 
 Run:
     python web_dashboard.py
@@ -9,10 +9,10 @@ Run:
 
 import json
 import os
+import sqlite3
 import sys
 import time
 import threading
-import subprocess
 from datetime import datetime, timezone
 
 import requests
@@ -55,6 +55,11 @@ _state = {
     "hourly": None,
     "hitrate": None,
     "daily": None,
+    # Wallet balance
+    "wallet_balance": None,
+    "wallet_status": "disconnected",
+    # Paper vs real comparison
+    "paper_vs_real": None,
 }
 _lock = threading.Lock()
 
@@ -80,18 +85,103 @@ def _bots_running() -> dict:
     return result
 
 
+# ── Helper: ensure trading_mode column exists ─────────────────────────────
+def _ensure_trading_mode_column(db_path: str, table: str):
+    """Add trading_mode column if it doesn't exist."""
+    try:
+        from utils.db import get_connection
+        conn = get_connection(db_path)
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN trading_mode TEXT DEFAULT 'paper'")
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
+        conn.close()
+    except Exception:
+        pass
+
+
+# ── Helper: ensure trade_mode column on trades tables ─────────────────────
+def _ensure_trade_mode_column(db_path: str, table: str):
+    """Add trade_mode column to trades table if it doesn't exist."""
+    try:
+        from utils.db import get_connection
+        conn = get_connection(db_path)
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN trade_mode TEXT DEFAULT 'paper'")
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
+        conn.close()
+    except Exception:
+        pass
+
+
+# ── Helper: get paper vs real comparison stats ────────────────────────────
+def _get_paper_vs_real() -> dict:
+    """Query trade stats grouped by trade_mode from both DBs."""
+    result = {"paper": {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0},
+              "real": {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0}}
+    for db_path, trades_table in [(config.FIVEMIN_DB_PATH, "fm_trades"),
+                                   (config.BINANCE_DB_PATH, "bn_trades")]:
+        try:
+            from utils.db import get_connection
+            conn = get_connection(db_path)
+            rows = conn.execute(
+                f"SELECT trade_mode, COUNT(*) as trades, "
+                f"SUM(CASE WHEN result='win' THEN 1 ELSE 0 END) as wins, "
+                f"COALESCE(SUM(pnl), 0) as total_pnl "
+                f"FROM {trades_table} GROUP BY trade_mode"
+            ).fetchall()
+            conn.close()
+            for row in rows:
+                r = dict(row)
+                mode = r.get("trade_mode", "paper") or "paper"
+                key = "real" if mode == "live" else "paper"
+                result[key]["trades"] += r.get("trades", 0)
+                result[key]["wins"] += r.get("wins", 0) or 0
+                result[key]["pnl"] += r.get("total_pnl", 0) or 0
+        except Exception:
+            pass
+    # Compute losses and win rates
+    for key in ["paper", "real"]:
+        t = result[key]["trades"]
+        w = result[key]["wins"]
+        result[key]["losses"] = t - w
+        result[key]["win_rate"] = (w / t * 100) if t > 0 else 0.0
+    return result
+
+
+# ── Helper: get current trading mode from DB ──────────────────────────────
+def _get_trading_mode(db_path: str, table: str) -> str:
+    """Read trading_mode from portfolio table."""
+    try:
+        from utils.db import get_connection
+        conn = get_connection(db_path)
+        row = conn.execute(f"SELECT trading_mode FROM {table} WHERE id = 1").fetchone()
+        conn.close()
+        if row:
+            return dict(row).get("trading_mode", "paper") or "paper"
+    except Exception:
+        pass
+    return "paper"
+
+
 # ── Data refresh ────────────────────────────────────────────────────────────
 def _refresh_db(tick: int):
     """Read DB data on appropriate intervals."""
     with _lock:
-        if tick % 2 == 0:
-            _state["fm"] = reader.get_fivemin_stats()
-            _state["bn"] = reader.get_binance_stats()
-            _state["cooldown"] = reader.get_cooldown_status()
+        # Stats and trades every tick (1s)
+        _state["fm"] = reader.get_fivemin_stats()
+        _state["bn"] = reader.get_binance_stats()
+        _state["cooldown"] = reader.get_cooldown_status()
+        _state["trades"] = reader.get_recent_trades(limit=20)
+
         if tick % 5 == 0:
-            _state["trades"] = reader.get_recent_trades(limit=10)
             _state["pnl"] = reader.get_pnl_history()
             _state["hitrate"] = reader.get_signal_hitrate()
+            _state["paper_vs_real"] = _get_paper_vs_real()
+
         if tick % 30 == 0 or _state["hourly"] is None:
             _state["hourly"] = reader.get_hourly_winrate()
             _state["daily"] = reader.get_daily_comparison()
@@ -154,23 +244,39 @@ def _fetch_candles():
         pass
 
 
+def _fetch_wallet_balance():
+    """Try to check wallet connection status."""
+    try:
+        if hasattr(config, 'PRIVATE_KEY') and config.PRIVATE_KEY:
+            with _lock:
+                _state["wallet_status"] = "connected"
+        else:
+            with _lock:
+                _state["wallet_status"] = "no_key"
+    except Exception:
+        with _lock:
+            _state["wallet_status"] = "disconnected"
+
+
 # ── Background thread: push data every second ──────────────────────────────
 def _background_loop():
     _fetch_prices()
     _fetch_candles()
+    _fetch_wallet_balance()
     price_tick = 0
     candle_tick = 0
+    wallet_tick = 0
 
     while True:
         tick = _state["tick"] + 1
         _state["tick"] = tick
 
-        # DB refresh
+        # DB refresh every tick
         _refresh_db(tick)
 
-        # Prices every 3 seconds
+        # Prices every 1 second
         price_tick += 1
-        if price_tick >= 3:
+        if price_tick >= 1:
             _fetch_prices()
             price_tick = 0
 
@@ -179,6 +285,12 @@ def _background_loop():
         if candle_tick >= 60:
             _fetch_candles()
             candle_tick = 0
+
+        # Wallet balance every 15 seconds
+        wallet_tick += 1
+        if wallet_tick >= 15:
+            _fetch_wallet_balance()
+            wallet_tick = 0
 
         # Build payload and emit
         payload = _build_payload()
@@ -201,6 +313,11 @@ def _build_payload() -> dict:
         hourly = _state["hourly"] or [{"hour": h, "trades": 0, "wins": 0, "rate": 0.0} for h in range(24)]
         hitrate = _state["hitrate"] or {"generated": 0, "skipped_price": 0, "skipped_risk": 0, "traded": 0, "won": 0}
         daily = _state["daily"] or {}
+        wallet_status = _state["wallet_status"]
+        paper_vs_real = _state["paper_vs_real"] or {
+            "paper": {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "win_rate": 0.0},
+            "real": {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "win_rate": 0.0},
+        }
 
     now = datetime.now(timezone.utc)
     now_ts = int(time.time())
@@ -208,6 +325,10 @@ def _build_payload() -> dict:
     wr = (now_ts - (now_ts % 300) + 300) - now_ts
 
     bots = _bots_running()
+
+    # Read trading modes from DB
+    fm_mode = _get_trading_mode(config.FIVEMIN_DB_PATH, "fm_portfolio")
+    bn_mode = _get_trading_mode(config.BINANCE_DB_PATH, "bn_portfolio")
 
     # Price arrows
     price_data = {}
@@ -262,6 +383,7 @@ def _build_payload() -> dict:
         pnl_val = tr.get("pnl", 0) or 0
         entry = tr.get("entry", 0) or 0
         size = tr.get("size", 0) or 0
+        trade_mode = tr.get("trade_mode", "paper") or "paper"
         trades_fmt.append({
             "time": tr.get("time", "")[-8:] if len(tr.get("time", "")) > 8 else tr.get("time", ""),
             "bot": tr.get("bot", ""),
@@ -271,7 +393,8 @@ def _build_payload() -> dict:
             "size": f"${size:.2f}",
             "result": tr.get("result", ""),
             "pnl": pnl_val,
-            "pnl_fmt": f"+${pnl_val:.2f}" if pnl_val > 0 else f"${pnl_val:.2f}" if pnl_val < 0 else "—",
+            "pnl_fmt": f"+${pnl_val:.2f}" if pnl_val > 0 else f"${pnl_val:.2f}" if pnl_val < 0 else "\u2014",
+            "trade_mode": trade_mode,
         })
 
     return {
@@ -295,7 +418,7 @@ def _build_payload() -> dict:
             "losses": fm_losses,
             "trades": fm_trades,
             "win_rate": fm_wr,
-            "mode": fm.get("mode", "paper"),
+            "mode": fm_mode,
             "is_paused": fm.get("is_paused", False),
             "daily_pnl": fm.get("daily_pnl", 0),
             "window_countdown": f"{wr // 60}:{wr % 60:02d}",
@@ -310,7 +433,7 @@ def _build_payload() -> dict:
             "trades": bn_trades,
             "win_rate": bn_wr,
             "open_positions": bn.get("open_positions", 0),
-            "mode": bn.get("mode", "paper"),
+            "mode": bn_mode,
             "is_paused": bn.get("is_paused", False),
             "daily_pnl": bn.get("daily_pnl", 0),
         },
@@ -328,6 +451,8 @@ def _build_payload() -> dict:
         },
         "signals": signals,
         "trades": trades_fmt,
+        "wallet_status": wallet_status,
+        "paper_vs_real": paper_vs_real,
     }
 
 
@@ -340,12 +465,12 @@ HTML = r"""<!DOCTYPE html>
 <title>MBH Trading Bots Command Center</title>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial@0.1.1/dist/chartjs-chart-financial.min.js" onerror="window._candleLib=false"></script>
 <style>
 /* ── Reset & Base ── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 :root {
   --bg:       #0a0a0f;
+  --bg-live:  #0a0f0a;
   --card:     #12121a;
   --border:   #1a1a2e;
   --green:    #00ff88;
@@ -363,8 +488,15 @@ body {
   font-family: 'Courier New', Courier, monospace;
   font-size: 13px;
   line-height: 1.5;
+  width: 100vw;
+  height: 100vh;
+  overflow-x: hidden;
+  overflow-y: auto;
   padding: 8px;
-  min-height: 100vh;
+  transition: background 0.5s ease;
+}
+body.live-mode {
+  background: var(--bg-live);
 }
 
 /* ── Header ── */
@@ -398,6 +530,15 @@ body {
 .dot { font-size: 0.75em; }
 .dot.on  { color: var(--green); }
 .dot.off { color: var(--red); }
+.wallet-badge {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.85em;
+  font-weight: bold;
+}
+.wallet-connected { background: #003300; color: var(--green); border: 1px solid var(--green); }
+.wallet-disconnected { background: #330000; color: var(--red); border: 1px solid var(--red); }
+.wallet-nokey { background: #332200; color: var(--yellow); border: 1px solid var(--yellow); }
 
 /* ── Cooldown Banner ── */
 #cooldown-banner {
@@ -413,26 +554,26 @@ body {
 }
 
 /* ── Grid Layout ── */
+.grid-top {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 10px;
+  margin-bottom: 10px;
+}
 .grid-2 {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
   gap: 10px;
   margin-bottom: 10px;
 }
 .grid-3 {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  gap: 10px;
-  margin-bottom: 10px;
-}
-.grid-top {
-  display: grid;
-  grid-template-columns: 1fr 1fr 200px;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
   gap: 10px;
   margin-bottom: 10px;
 }
 @media (max-width: 900px) {
-  .grid-top, .grid-2, .grid-3 {
+  .grid-top {
     grid-template-columns: 1fr 1fr;
   }
 }
@@ -449,6 +590,11 @@ body {
   border-radius: 8px;
   padding: 12px;
   overflow: hidden;
+  transition: border-color 0.3s, box-shadow 0.3s;
+}
+.card.live-glow {
+  border-color: var(--green);
+  box-shadow: 0 0 15px rgba(0, 255, 136, 0.3);
 }
 .card-title {
   color: var(--cyan);
@@ -470,6 +616,62 @@ body {
 }
 .badge-live  { background: #003300; color: var(--green); border: 1px solid var(--green); }
 .badge-paper { background: #332200; color: var(--yellow); border: 1px solid var(--yellow); }
+
+/* ── Mode Toggle Switch ── */
+.mode-toggle-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.mode-label {
+  font-size: 0.75em;
+  text-transform: uppercase;
+  font-weight: bold;
+}
+.mode-label.paper-label { color: var(--yellow); }
+.mode-label.live-label { color: var(--green); }
+.mode-switch {
+  position: relative;
+  width: 40px;
+  height: 20px;
+  cursor: pointer;
+}
+.mode-switch input { display: none; }
+.mode-slider {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: #332200;
+  border: 1px solid var(--yellow);
+  border-radius: 10px;
+  transition: background 0.3s, border-color 0.3s;
+}
+.mode-slider::before {
+  content: '';
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  left: 2px;
+  top: 2px;
+  background: var(--yellow);
+  border-radius: 50%;
+  transition: transform 0.3s, background 0.3s;
+}
+.mode-switch input:checked + .mode-slider {
+  background: #003300;
+  border-color: var(--green);
+}
+.mode-switch input:checked + .mode-slider::before {
+  transform: translateX(20px);
+  background: var(--green);
+}
+/* Pulse animation for live mode */
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 4px rgba(0, 255, 136, 0.4); }
+  50% { box-shadow: 0 0 12px rgba(0, 255, 136, 0.8); }
+}
+.mode-switch.live-pulse .mode-slider {
+  animation: pulse-glow 1.5s ease-in-out infinite;
+}
 
 /* ── Bot Card Stats ── */
 .bot-balance {
@@ -578,6 +780,32 @@ body {
 .down-color { color: var(--red); }
 .neut-color { color: var(--dim); }
 
+/* ── Paper vs Real Comparison ── */
+.compare-grid {
+  display: grid;
+  grid-template-columns: auto 1fr 1fr;
+  gap: 0;
+  font-size: 0.85em;
+}
+.compare-grid .compare-header {
+  font-weight: bold;
+  text-align: center;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.compare-grid .compare-label {
+  color: var(--text-dim);
+  padding: 3px 8px;
+  border-right: 1px solid var(--border);
+}
+.compare-grid .compare-val {
+  text-align: center;
+  padding: 3px 8px;
+  font-weight: bold;
+}
+.compare-paper-hdr { color: var(--yellow); }
+.compare-real-hdr { color: var(--green); }
+
 /* ── Trades Table ── */
 .trades-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 0.82em; }
@@ -606,6 +834,16 @@ tr:hover td { background: #15151f; }
 .pnl-pos  { color: var(--green); }
 .pnl-neg  { color: var(--red); }
 .pnl-zero { color: var(--dim); }
+/* Mode tags in trades table */
+.mode-tag {
+  display: inline-block;
+  font-size: 0.75em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-weight: bold;
+}
+.mode-tag-real { background: #003300; color: var(--green); border: 1px solid var(--green); }
+.mode-tag-paper { background: #332200; color: var(--yellow); border: 1px solid var(--yellow); }
 
 /* ── Connection indicator ── */
 #conn-dot {
@@ -617,6 +855,7 @@ tr:hover td { background: #15151f; }
   border-radius: 50%;
   background: var(--red);
   transition: background 0.3s;
+  z-index: 100;
 }
 #conn-dot.connected { background: var(--green); }
 
@@ -643,6 +882,7 @@ tr:hover td { background: #15151f; }
     <span class="bot-indicator">5M <span id="dot-5m" class="dot off">&#9679;</span></span>
     <span class="bot-indicator">BN <span id="dot-bn" class="dot off">&#9679;</span></span>
     <span class="bot-indicator">PB <span id="dot-pb" class="dot off">&#9679;</span></span>
+    <span id="wallet-display" class="wallet-badge wallet-disconnected">Wallet: --</span>
   </div>
 </div>
 
@@ -655,10 +895,16 @@ tr:hover td { background: #15151f; }
 <div class="grid-top">
 
   <!-- PolyBot 5M -->
-  <div class="card">
+  <div class="card" id="fm-card">
     <div class="card-title">
       <span>&#9889; POLYBOT 5M</span>
-      <span id="fm-badge" class="badge badge-paper">PAPER</span>
+      <div class="mode-toggle-wrap">
+        <span id="fm-badge" class="badge badge-paper">PAPER</span>
+        <label class="mode-switch" id="fm-switch">
+          <input type="checkbox" id="fm-toggle" onchange="handleModeSwitch('5m', this)">
+          <span class="mode-slider"></span>
+        </label>
+      </div>
     </div>
     <div class="bot-balance" id="fm-balance">$0.00</div>
     <div class="bot-pnl dim" id="fm-pnl">+$0.00 (0.0%)</div>
@@ -669,10 +915,16 @@ tr:hover td { background: #15151f; }
   </div>
 
   <!-- BinanceBot -->
-  <div class="card">
+  <div class="card" id="bn-card">
     <div class="card-title">
       <span>&#128202; BINANCEBOT</span>
-      <span id="bn-badge" class="badge badge-paper">PAPER</span>
+      <div class="mode-toggle-wrap">
+        <span id="bn-badge" class="badge badge-paper">PAPER</span>
+        <label class="mode-switch" id="bn-switch">
+          <input type="checkbox" id="bn-toggle" onchange="handleModeSwitch('bn', this)">
+          <span class="mode-slider"></span>
+        </label>
+      </div>
     </div>
     <div class="bot-balance" id="bn-balance">$0.00</div>
     <div class="bot-pnl dim" id="bn-pnl">+$0.00 (0.0%)</div>
@@ -703,7 +955,7 @@ tr:hover td { background: #15151f; }
   </div>
 </div>
 
-<!-- Row 2: P&L Chart + BTC Candlestick -->
+<!-- Row 2: P&L Chart + BTC Chart -->
 <div class="grid-2">
   <div class="card">
     <div class="card-title">P&L Chart (24h)</div>
@@ -711,9 +963,9 @@ tr:hover td { background: #15151f; }
       <canvas id="pnl-chart"></canvas>
     </div>
     <div style="margin-top:5px;font-size:0.75em;display:flex;gap:12px;">
-      <span><span style="color:var(--green)">&#9135;</span> Combined</span>
-      <span><span style="color:var(--yellow)">&#9135;</span> 5M</span>
-      <span><span style="color:var(--cyan)">&#9135;</span> Binance</span>
+      <span><span style="color:#00ff88">&#9135;</span> Combined</span>
+      <span><span style="color:#ffaa00">&#9135;</span> 5M</span>
+      <span><span style="color:#00aaff">&#9135;</span> Binance</span>
     </div>
   </div>
   <div class="card">
@@ -747,7 +999,7 @@ tr:hover td { background: #15151f; }
     <div class="daily-row"><span class="lbl">Generated</span><span id="sig-gen" class="cyan">0</span></div>
     <div class="daily-row"><span class="lbl">Skipped</span><span id="sig-skip" class="yellow">0</span></div>
     <div class="daily-row"><span class="lbl">Traded</span><span id="sig-traded" class="cyan">0</span></div>
-    <div class="daily-row"><span class="lbl">Won</span><span id="sig-won">—</span></div>
+    <div class="daily-row"><span class="lbl">Won</span><span id="sig-won">&mdash;</span></div>
     <div class="funnel-bar" id="funnel-bar">
       <div class="funnel-won"  id="funnel-won-w"  style="width:0%"></div>
       <div class="funnel-traded" id="funnel-traded-w" style="width:0%"></div>
@@ -778,6 +1030,31 @@ tr:hover td { background: #15151f; }
   <div id="signals-list"></div>
 </div>
 
+<!-- Paper vs Real Comparison -->
+<div class="card" id="compare-card" style="margin-bottom:10px;">
+  <div class="card-title">Paper vs Real Comparison</div>
+  <div class="compare-grid" id="compare-grid">
+    <div class="compare-label" style="border-bottom:1px solid var(--border);">&nbsp;</div>
+    <div class="compare-header compare-paper-hdr" style="border-bottom:1px solid var(--border);">PAPER</div>
+    <div class="compare-header compare-real-hdr" style="border-bottom:1px solid var(--border);">REAL</div>
+    <div class="compare-label">Trades</div>
+    <div class="compare-val" id="cmp-paper-trades">0</div>
+    <div class="compare-val" id="cmp-real-trades">0</div>
+    <div class="compare-label">Wins</div>
+    <div class="compare-val" id="cmp-paper-wins">0</div>
+    <div class="compare-val" id="cmp-real-wins">0</div>
+    <div class="compare-label">Losses</div>
+    <div class="compare-val" id="cmp-paper-losses">0</div>
+    <div class="compare-val" id="cmp-real-losses">0</div>
+    <div class="compare-label">Win Rate</div>
+    <div class="compare-val" id="cmp-paper-wr">0%</div>
+    <div class="compare-val" id="cmp-real-wr">0%</div>
+    <div class="compare-label">P&L</div>
+    <div class="compare-val" id="cmp-paper-pnl">$0.00</div>
+    <div class="compare-val" id="cmp-real-pnl">$0.00</div>
+  </div>
+</div>
+
 <!-- Trades Table -->
 <div class="card" style="margin-bottom:10px;">
   <div class="card-title">Recent Trades</div>
@@ -787,6 +1064,7 @@ tr:hover td { background: #15151f; }
         <tr>
           <th>Time</th>
           <th>Bot</th>
+          <th>Mode</th>
           <th>Asset</th>
           <th>Dir</th>
           <th>Entry</th>
@@ -796,13 +1074,13 @@ tr:hover td { background: #15151f; }
         </tr>
       </thead>
       <tbody id="trades-body">
-        <tr><td colspan="8" class="dim" style="text-align:center;padding:12px;">Waiting for trades…</td></tr>
+        <tr><td colspan="9" class="dim" style="text-align:center;padding:12px;">Waiting for trades...</td></tr>
       </tbody>
     </table>
   </div>
 </div>
 
-<div id="footer">MBH Trading Bots Command Center &bull; WebSocket live &bull; Port 8080</div>
+<div id="footer">MBH Trading Bots Command Center &bull; Dashboard V2 &bull; WebSocket live &bull; Port 8080</div>
 
 <script>
 // ── Socket.IO ─────────────────────────────────────────────────────────────
@@ -811,6 +1089,19 @@ const connDot = document.getElementById('conn-dot');
 
 socket.on('connect',    () => connDot.classList.add('connected'));
 socket.on('disconnect', () => connDot.classList.remove('connected'));
+
+// ── Mode Switch Handler ──────────────────────────────────────────────────
+function handleModeSwitch(bot, checkbox) {
+  const newMode = checkbox.checked ? 'live' : 'paper';
+  if (newMode === 'live') {
+    if (!confirm('Switch to REAL MONEY trading?')) {
+      checkbox.checked = false;
+      return;
+    }
+  }
+  const botKey = bot === '5m' ? '5m' : 'bn';
+  socket.emit('switch_mode', { bot: botKey, mode: newMode });
+}
 
 // ── Chart instances ───────────────────────────────────────────────────────
 let pnlChart = null;
@@ -855,12 +1146,15 @@ function initBtcChart() {
       animation: false,
       plugins: { legend: { display: false }, tooltip: {
         callbacks: {
-          label: ctx => {
-            const d = ctx.raw;
-            if (d && typeof d === 'object') {
-              return [`O: $${d.o?.toLocaleString()}`, `H: $${d.h?.toLocaleString()}`, `L: $${d.l?.toLocaleString()}`, `C: $${d.c?.toLocaleString()}`];
+          title: (items) => items[0] ? items[0].label : '',
+          label: (ctx) => {
+            const idx = ctx.dataIndex;
+            const meta = btcChart._candleMeta || [];
+            if (meta[idx]) {
+              const m = meta[idx];
+              return ['O: $' + m.o.toLocaleString(), 'H: $' + m.h.toLocaleString(), 'L: $' + m.l.toLocaleString(), 'C: $' + m.c.toLocaleString()];
             }
-            return '';
+            return '$' + (ctx.parsed.y || 0).toLocaleString();
           }
         }
       }},
@@ -873,6 +1167,7 @@ function initBtcChart() {
       },
     },
   });
+  btcChart._candleMeta = [];
 }
 
 initPnlChart();
@@ -888,6 +1183,10 @@ function setText(id, txt, cls) {
   if (cls !== undefined) { el.className = cls; }
 }
 
+// Track current modes to avoid flicker on toggle
+let currentFmMode = 'paper';
+let currentBnMode = 'paper';
+
 // ── Main update handler ───────────────────────────────────────────────────
 socket.on('dashboard_update', function(d) {
   // Header
@@ -898,6 +1197,22 @@ socket.on('dashboard_update', function(d) {
   for (const [k, on] of Object.entries(dots)) {
     const el = document.getElementById('dot-' + k);
     if (el) { el.className = 'dot ' + (on ? 'on' : 'off'); }
+  }
+
+  // Wallet display
+  const walletEl = document.getElementById('wallet-display');
+  if (walletEl) {
+    const ws = d.wallet_status || 'disconnected';
+    if (ws === 'connected') {
+      walletEl.textContent = 'Wallet: Connected';
+      walletEl.className = 'wallet-badge wallet-connected';
+    } else if (ws === 'no_key') {
+      walletEl.textContent = 'Wallet: No Key';
+      walletEl.className = 'wallet-badge wallet-nokey';
+    } else {
+      walletEl.textContent = 'Wallet: --';
+      walletEl.className = 'wallet-badge wallet-disconnected';
+    }
   }
 
   // Cooldown banner
@@ -915,11 +1230,32 @@ socket.on('dashboard_update', function(d) {
   // PolyBot 5M card
   const fm = d.fm || {};
   const fmPnl = fm.pnl || 0;
+  const fmMode = fm.mode || 'paper';
+  currentFmMode = fmMode;
+
   const fmBadge = document.getElementById('fm-badge');
   if (fmBadge) {
-    fmBadge.textContent = (fm.mode || 'paper').toUpperCase();
-    fmBadge.className = 'badge ' + (fm.mode === 'live' ? 'badge-live' : 'badge-paper');
+    fmBadge.textContent = fmMode.toUpperCase();
+    fmBadge.className = 'badge ' + (fmMode === 'live' ? 'badge-live' : 'badge-paper');
   }
+  // Sync toggle state without triggering onchange
+  const fmToggle = document.getElementById('fm-toggle');
+  if (fmToggle && fmToggle !== document.activeElement) {
+    fmToggle.checked = (fmMode === 'live');
+  }
+  // Toggle pulse class
+  const fmSwitch = document.getElementById('fm-switch');
+  if (fmSwitch) {
+    if (fmMode === 'live') { fmSwitch.classList.add('live-pulse'); }
+    else { fmSwitch.classList.remove('live-pulse'); }
+  }
+  // Card glow
+  const fmCard = document.getElementById('fm-card');
+  if (fmCard) {
+    if (fmMode === 'live') { fmCard.classList.add('live-glow'); }
+    else { fmCard.classList.remove('live-glow'); }
+  }
+
   const fmBalEl = document.getElementById('fm-balance');
   if (fmBalEl) {
     fmBalEl.textContent = '$' + (fm.balance || 0).toFixed(2);
@@ -948,11 +1284,29 @@ socket.on('dashboard_update', function(d) {
   // BinanceBot card
   const bn = d.bn || {};
   const bnPnl = bn.pnl || 0;
+  const bnMode = bn.mode || 'paper';
+  currentBnMode = bnMode;
+
   const bnBadge = document.getElementById('bn-badge');
   if (bnBadge) {
-    bnBadge.textContent = (bn.mode || 'paper').toUpperCase();
-    bnBadge.className = 'badge ' + (bn.mode === 'live' ? 'badge-live' : 'badge-paper');
+    bnBadge.textContent = bnMode.toUpperCase();
+    bnBadge.className = 'badge ' + (bnMode === 'live' ? 'badge-live' : 'badge-paper');
   }
+  const bnToggle = document.getElementById('bn-toggle');
+  if (bnToggle && bnToggle !== document.activeElement) {
+    bnToggle.checked = (bnMode === 'live');
+  }
+  const bnSwitch = document.getElementById('bn-switch');
+  if (bnSwitch) {
+    if (bnMode === 'live') { bnSwitch.classList.add('live-pulse'); }
+    else { bnSwitch.classList.remove('live-pulse'); }
+  }
+  const bnCard = document.getElementById('bn-card');
+  if (bnCard) {
+    if (bnMode === 'live') { bnCard.classList.add('live-glow'); }
+    else { bnCard.classList.remove('live-glow'); }
+  }
+
   const bnBalEl = document.getElementById('bn-balance');
   if (bnBalEl) {
     bnBalEl.textContent = '$' + (bn.balance || 0).toFixed(2);
@@ -977,6 +1331,13 @@ socket.on('dashboard_update', function(d) {
   }
   setText('bn-open', bn.open_positions || 0);
 
+  // Live mode body background
+  if (fmMode === 'live' || bnMode === 'live') {
+    document.body.classList.add('live-mode');
+  } else {
+    document.body.classList.remove('live-mode');
+  }
+
   // Prices
   const assets = { btc: 'BTC', eth: 'ETH', sol: 'SOL' };
   for (const [key, sym] of Object.entries(assets)) {
@@ -988,17 +1349,25 @@ socket.on('dashboard_update', function(d) {
       pEl.className = 'price-val ' + (pd.color || '');
     }
     if (aEl) {
-      aEl.textContent = pd.arrow || '—';
+      aEl.textContent = pd.arrow || '\u2014';
       aEl.className = 'price-arrow ' + (pd.color || '');
     }
   }
 
-  // P&L Chart
+  // P&L Chart - handle empty/single data points by padding with zeros
   const pc = d.pnl_chart || {};
-  const combined = pc.combined || [0, 0];
-  const fm5m     = pc.fivemin  || [0, 0];
-  const binance  = pc.binance  || [0, 0];
+  let combined = pc.combined || [];
+  let fm5m     = pc.fivemin  || [];
+  let binance  = pc.binance  || [];
+  // Pad to at least 2 points for the chart to render a line
+  if (combined.length < 2) combined = [0, ...combined, ...(combined.length === 0 ? [0] : [])];
+  if (fm5m.length < 2) fm5m = [0, ...fm5m, ...(fm5m.length === 0 ? [0] : [])];
+  if (binance.length < 2) binance = [0, ...binance, ...(binance.length === 0 ? [0] : [])];
   const maxLen   = Math.max(combined.length, fm5m.length, binance.length);
+  // Pad shorter arrays with zeros at the beginning
+  while (combined.length < maxLen) combined.unshift(0);
+  while (fm5m.length < maxLen) fm5m.unshift(0);
+  while (binance.length < maxLen) binance.unshift(0);
   const labels   = Array.from({ length: maxLen }, (_, i) => i + 1);
   if (pnlChart) {
     pnlChart.data.labels            = labels;
@@ -1008,7 +1377,7 @@ socket.on('dashboard_update', function(d) {
     pnlChart.update('none');
   }
 
-  // BTC Candlestick (using bar chart approximation)
+  // BTC Chart - bar chart styled as candles (green=up, red=down)
   const candles = d.candles || [];
   if (btcChart && candles.length > 0) {
     const labels24 = candles.map((_, i) => {
@@ -1016,26 +1385,31 @@ socket.on('dashboard_update', function(d) {
       h.setUTCHours(h.getUTCHours() - (candles.length - 1 - i));
       return h.getUTCHours() + ':00';
     });
-    // Use high-low range as bar data; color by open/close
-    const barData = candles.map(c => ({
-      x: c,
-      // We store OHLC for tooltip
-      o: c.open, h: c.high, l: c.low, c: c.close,
-      // Bar value = high (we'll set min via custom drawing)
-      y: c.high,
-    }));
-    const bgColors  = candles.map(c => c.close >= c.open ? 'rgba(0,255,136,0.7)' : 'rgba(255,68,68,0.7)');
+
+    // Each bar represents the open-close range
+    const barData = candles.map(c => {
+      const bodyTop = Math.max(c.open, c.close);
+      const bodyBottom = Math.min(c.open, c.close);
+      return bodyTop - bodyBottom;  // bar height = absolute body size
+    });
+
+    const bgColors = candles.map(c => c.close >= c.open ? 'rgba(0,255,136,0.7)' : 'rgba(255,68,68,0.7)');
     const brdColors = candles.map(c => c.close >= c.open ? '#00ff88' : '#ff4444');
 
+    // Store OHLC metadata for tooltips
+    btcChart._candleMeta = candles.map(c => ({ o: c.open, h: c.high, l: c.low, c: c.close }));
+
     btcChart.data.labels = labels24;
-    btcChart.data.datasets[0].data            = candles.map(c => c.high - c.low);
+    btcChart.data.datasets[0].data = barData;
     btcChart.data.datasets[0].backgroundColor = bgColors;
-    btcChart.data.datasets[0].borderColor     = brdColors;
-    // Set y-axis min to floor
-    const minLow  = Math.min(...candles.map(c => c.low));
-    const maxHigh = Math.max(...candles.map(c => c.high));
-    btcChart.options.scales.y.min = minLow * 0.999;
-    btcChart.options.scales.y.max = maxHigh * 1.001;
+    btcChart.data.datasets[0].borderColor = brdColors;
+
+    // Set y-axis to show body range context
+    const allBodies = candles.map(c => Math.abs(c.close - c.open));
+    const maxBody = Math.max(...allBodies);
+    btcChart.options.scales.y.min = 0;
+    btcChart.options.scales.y.max = maxBody * 1.2;
+    btcChart.options.scales.y.ticks.callback = v => '$' + v.toFixed(0);
     btcChart.update('none');
   }
 
@@ -1094,7 +1468,7 @@ socket.on('dashboard_update', function(d) {
       sigWonEl.textContent = won + '/' + traded + ' (' + (won / traded * 100).toFixed(0) + '%)';
       sigWonEl.className   = won / traded >= 0.5 ? 'green' : 'red';
     } else {
-      sigWonEl.textContent = '—';
+      sigWonEl.textContent = '\u2014';
       sigWonEl.className   = 'dim';
     }
   }
@@ -1145,7 +1519,7 @@ socket.on('dashboard_update', function(d) {
         const v = s[k] || '';
         if (v === 'UP')   return '<span class="sig-arrow up-color">&#8593;</span>';
         if (v === 'DOWN') return '<span class="sig-arrow down-color">&#8595;</span>';
-        return '<span class="sig-arrow neut-color">·</span>';
+        return '<span class="sig-arrow neut-color">&middot;</span>';
       }).join('');
 
       let dirHtml = '';
@@ -1153,45 +1527,81 @@ socket.on('dashboard_update', function(d) {
         const dc = s.signal === 'UP' ? 'green' : 'red';
         const agree = s.agree_count || 0;
         const conf  = ((s.confidence || 0) * 100).toFixed(0);
-        dirHtml = `<span class="sig-dir ${dc}">${agree}/3 ${s.signal}</span><span class="sig-conf"> (${conf}%)</span>`;
+        dirHtml = '<span class="sig-dir ' + dc + '">' + agree + '/3 ' + s.signal + '</span><span class="sig-conf"> (' + conf + '%)</span>';
       }
 
-      row.innerHTML = `
-        <span class="sig-asset" style="color:${ac}">${s.asset}</span>
-        <span class="sig-ind">${indHtml}</span>
-        ${dirHtml}
-      `;
+      row.innerHTML = '<span class="sig-asset" style="color:' + ac + '">' + s.asset + '</span>' +
+        '<span class="sig-ind">' + indHtml + '</span>' + dirHtml;
       sigsList.appendChild(row);
     }
   } else if (sigsCard) {
     sigsCard.style.display = 'none';
   }
 
-  // Trades Table
+  // Paper vs Real Comparison
+  const pvr = d.paper_vs_real || {};
+  const paper = pvr.paper || {};
+  const real = pvr.real || {};
+  setText('cmp-paper-trades', paper.trades || 0);
+  setText('cmp-real-trades', real.trades || 0);
+  setText('cmp-paper-wins', paper.wins || 0);
+  setText('cmp-real-wins', real.wins || 0);
+  setText('cmp-paper-losses', paper.losses || 0);
+  setText('cmp-real-losses', real.losses || 0);
+  const paperWr = paper.win_rate || 0;
+  const realWr = real.win_rate || 0;
+  const paperWrEl = document.getElementById('cmp-paper-wr');
+  if (paperWrEl) {
+    paperWrEl.textContent = paperWr.toFixed(1) + '%';
+    paperWrEl.className = 'compare-val ' + ((paper.trades || 0) > 0 ? (paperWr >= 50 ? 'green' : 'red') : 'dim');
+  }
+  const realWrEl = document.getElementById('cmp-real-wr');
+  if (realWrEl) {
+    realWrEl.textContent = realWr.toFixed(1) + '%';
+    realWrEl.className = 'compare-val ' + ((real.trades || 0) > 0 ? (realWr >= 50 ? 'green' : 'red') : 'dim');
+  }
+  const paperPnlEl = document.getElementById('cmp-paper-pnl');
+  if (paperPnlEl) {
+    const pp = paper.pnl || 0;
+    paperPnlEl.textContent = pnlFmt(pp);
+    paperPnlEl.className = 'compare-val ' + pnlClass(pp);
+  }
+  const realPnlEl = document.getElementById('cmp-real-pnl');
+  if (realPnlEl) {
+    const rp = real.pnl || 0;
+    realPnlEl.textContent = pnlFmt(rp);
+    realPnlEl.className = 'compare-val ' + pnlClass(rp);
+  }
+
+  // Trades Table with Mode column
   const tbody = document.getElementById('trades-body');
   if (tbody) {
     const trades = d.trades || [];
     if (trades.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="8" class="dim" style="text-align:center;padding:12px;">Waiting for trades…</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="9" class="dim" style="text-align:center;padding:12px;">Waiting for trades...</td></tr>';
     } else {
       tbody.innerHTML = '';
       for (const tr of trades) {
         const botCls = tr.bot === '5M' ? 'bot-5m' : tr.bot === 'BN' ? 'bot-bn' : 'bot-poly';
         const resCls = tr.result === 'win' ? 'res-win' : tr.result === 'loss' ? 'res-loss' : tr.result === 'open' ? 'res-open' : 'res-pend';
-        const resLabel = tr.result === 'win' ? 'WIN' : tr.result === 'loss' ? 'LOSS' : tr.result === 'open' ? 'OPEN' : '…';
+        const resLabel = tr.result === 'win' ? 'WIN' : tr.result === 'loss' ? 'LOSS' : tr.result === 'open' ? 'OPEN' : '...';
         const pnlCls = tr.pnl > 0 ? 'pnl-pos' : tr.pnl < 0 ? 'pnl-neg' : 'pnl-zero';
-        const dirArrow = tr.direction === 'LONG' || tr.direction === 'UP' ? '▲' : tr.direction === 'SHORT' || tr.direction === 'DOWN' ? '▼' : tr.direction;
+        const dirArrow = tr.direction === 'LONG' || tr.direction === 'UP' ? '\u25B2' : tr.direction === 'SHORT' || tr.direction === 'DOWN' ? '\u25BC' : tr.direction;
+        const tMode = tr.trade_mode || 'paper';
+        const modeTag = tMode === 'live'
+          ? '<span class="mode-tag mode-tag-real">\uD83D\uDFE2 REAL</span>'
+          : '<span class="mode-tag mode-tag-paper">\uD83D\uDFE1 PAPER</span>';
         const row = document.createElement('tr');
-        row.innerHTML = `
-          <td class="dim">${tr.time}</td>
-          <td class="${botCls}">${tr.bot}</td>
-          <td>${tr.asset}</td>
-          <td>${dirArrow}</td>
-          <td>${tr.entry}</td>
-          <td class="dim">${tr.size}</td>
-          <td class="${resCls}">${resLabel}</td>
-          <td class="${pnlCls}">${tr.pnl_fmt}</td>
-        `;
+        row.innerHTML =
+          '<td class="dim">' + tr.time + '</td>' +
+          '<td class="' + botCls + '">' + tr.bot + '</td>' +
+          '<td>' + modeTag + '</td>' +
+          '<td>' + dirArrow + '</td>' +
+          '<td>' + (tr.asset || '') + '</td>' +
+          '<td>' + tr.entry + '</td>' +
+          '<td class="dim">' + tr.size + '</td>' +
+          '<td class="' + resCls + '">' + resLabel + '</td>' +
+          '<td class="' + pnlCls + '">' + tr.pnl_fmt + '</td>';
         tbody.appendChild(row);
       }
     }
@@ -1203,6 +1613,39 @@ socket.on('dashboard_update', function(d) {
 """
 
 
+# ── WebSocket event handlers ──────────────────────────────────────────────
+@socketio.on('switch_mode')
+def handle_switch_mode(data):
+    """Handle mode switch from frontend."""
+    bot = data.get('bot', '')
+    mode = data.get('mode', 'paper')
+    if mode not in ('live', 'paper'):
+        return
+
+    if bot == '5m':
+        db_path = config.FIVEMIN_DB_PATH
+        table = 'fm_portfolio'
+    elif bot == 'bn':
+        db_path = config.BINANCE_DB_PATH
+        table = 'bn_portfolio'
+    else:
+        return
+
+    # Ensure column exists
+    _ensure_trading_mode_column(db_path, table)
+
+    # Update the mode
+    try:
+        from utils.db import get_connection
+        conn = get_connection(db_path)
+        conn.execute(f"UPDATE {table} SET trading_mode = ? WHERE id = 1", (mode,))
+        conn.commit()
+        conn.close()
+        print(f"[Dashboard] Mode switch: {bot.upper()} -> {mode.upper()}")
+    except Exception as e:
+        print(f"[Dashboard] Error switching mode for {bot}: {e}")
+
+
 # ── Flask routes ────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
@@ -1211,26 +1654,33 @@ def index():
 
 @app.route("/api/data")
 def api_data():
-    """REST fallback — returns current dashboard snapshot as JSON."""
+    """REST fallback - returns current dashboard snapshot as JSON."""
     from flask import jsonify
     return jsonify(_build_payload())
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("Starting MBH Trading Bots Web Dashboard on http://0.0.0.0:8080")
+    print("Starting MBH Trading Bots Web Dashboard V2 on http://0.0.0.0:8080")
     print("Press Ctrl+C to stop.\n")
+
+    # Ensure trading_mode columns exist
+    _ensure_trading_mode_column(config.FIVEMIN_DB_PATH, "fm_portfolio")
+    _ensure_trading_mode_column(config.BINANCE_DB_PATH, "bn_portfolio")
+    _ensure_trade_mode_column(config.FIVEMIN_DB_PATH, "fm_trades")
+    _ensure_trade_mode_column(config.BINANCE_DB_PATH, "bn_trades")
 
     # Seed initial DB data
     with _lock:
         _state["fm"]      = reader.get_fivemin_stats()
         _state["bn"]      = reader.get_binance_stats()
         _state["cooldown"] = reader.get_cooldown_status()
-        _state["trades"]  = reader.get_recent_trades(limit=10)
+        _state["trades"]  = reader.get_recent_trades(limit=20)
         _state["pnl"]     = reader.get_pnl_history()
         _state["hitrate"] = reader.get_signal_hitrate()
         _state["hourly"]  = reader.get_hourly_winrate()
         _state["daily"]   = reader.get_daily_comparison()
+        _state["paper_vs_real"] = _get_paper_vs_real()
 
     # Background push thread
     bg = threading.Thread(target=_background_loop, daemon=True)
