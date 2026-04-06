@@ -68,9 +68,15 @@ class FiveMinTradeExecutor:
         }
 
     def _init_clob_client(self):
-        """Initialize py-clob-client for live trading (no proxy needed for API)."""
+        """Initialize py-clob-client for live trading with SOCKS5 proxy."""
         if self._clob_client is not None:
             return
+
+        # Route through WARP SOCKS5 proxy to bypass geo-block
+        import socks
+        import socket
+        socks.set_default_proxy(socks.SOCKS5, '127.0.0.1', 40000)
+        socket.socket = socks.socksocket
 
         from py_clob_client.client import ClobClient
 
@@ -83,7 +89,7 @@ class FiveMinTradeExecutor:
         )
         creds = self._clob_client.derive_api_key()
         self._clob_client.set_api_creds(creds)
-        log.info("LIVE: py-clob-client authenticated")
+        log.info("LIVE: py-clob-client authenticated (via SOCKS5 proxy)")
 
     def _execute_live(self, signal: Signal, amount: float, limit_price: float,
                       token_id: str, condition_id: str) -> dict:
