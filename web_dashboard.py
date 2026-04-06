@@ -245,17 +245,52 @@ def _fetch_candles():
 
 
 def _fetch_wallet_balance():
-    """Try to check wallet connection status."""
+    """Fetch wallet balance from bot database (auto-updated by bots as they trade).
+
+    Polymarket doesn't expose a cash balance API. The bots track balance
+    in their portfolio tables, updating it on every trade and resolution.
+    The dashboard reads this tracked balance every second.
+    """
     try:
-        if hasattr(config, 'PRIVATE_KEY') and config.PRIVATE_KEY:
-            with _lock:
-                _state["wallet_status"] = "connected"
-        else:
+        pk = getattr(config, 'PRIVATE_KEY', '')
+        if not pk:
             with _lock:
                 _state["wallet_status"] = "no_key"
+            return
+
+        total_balance = 0.0
+
+        # Read PolyBot 5M balance
+        try:
+            import sqlite3 as _sql
+            conn = _sql.connect(config.FIVEMIN_DB_PATH)
+            conn.row_factory = _sql.Row
+            row = conn.execute("SELECT balance FROM fm_portfolio WHERE id = 1").fetchone()
+            if row:
+                total_balance += row["balance"]
+            conn.close()
+        except Exception:
+            pass
+
+        # Read BinanceBot balance
+        try:
+            import sqlite3 as _sql
+            conn = _sql.connect(config.BINANCE_DB_PATH)
+            conn.row_factory = _sql.Row
+            row = conn.execute("SELECT balance FROM bn_portfolio WHERE id = 1").fetchone()
+            if row:
+                total_balance += row["balance"]
+            conn.close()
+        except Exception:
+            pass
+
+        with _lock:
+            _state["wallet_balance"] = round(total_balance, 2)
+            _state["wallet_status"] = "connected"
+
     except Exception:
         with _lock:
-            _state["wallet_status"] = "disconnected"
+            _state["wallet_status"] = "error"
 
 
 # ── Background thread: push data every second ──────────────────────────────
@@ -452,6 +487,7 @@ def _build_payload() -> dict:
         "signals": signals,
         "trades": trades_fmt,
         "wallet_status": wallet_status,
+        "wallet_balance": _state.get("wallet_balance"),
         "paper_vs_real": paper_vs_real,
     }
 
@@ -1204,7 +1240,8 @@ socket.on('dashboard_update', function(d) {
   if (walletEl) {
     const ws = d.wallet_status || 'disconnected';
     if (ws === 'connected') {
-      walletEl.textContent = 'Wallet: Connected';
+      const wb = d.wallet_balance;
+      walletEl.textContent = wb !== null ? 'Wallet: $' + wb.toFixed(2) : 'Wallet: Connected';
       walletEl.className = 'wallet-badge wallet-connected';
     } else if (ws === 'no_key') {
       walletEl.textContent = 'Wallet: No Key';
