@@ -133,6 +133,28 @@ class FiveMinTradeExecutor:
             log.error("LIVE: No token ID for order")
             return {"status": "error", "reason": "No token ID"}
 
+        # Stage 1: Maker mode — replace caller's limit_price with fair value
+        if getattr(self.config, "FIVEMIN_MAKER_MODE_ENABLED", False):
+            score = sum(
+                1 for v in signal.indicators.values()
+                if isinstance(v, dict) and v.get("direction") == signal.direction
+            )
+            fair = compute_fair_value(
+                score=score,
+                confidence=signal.confidence,
+                min_price=getattr(self.config, "FIVEMIN_MAKER_MIN_PRICE", 0.05),
+                max_price=getattr(self.config, "FIVEMIN_MAKER_MAX_PRICE", 0.80),
+            )
+            offset = getattr(self.config, "FIVEMIN_MAKER_FAIR_VALUE_OFFSET", 0.05)
+            limit_price = max(
+                getattr(self.config, "FIVEMIN_MAKER_MIN_PRICE", 0.05),
+                round(fair - offset, 2),
+            )
+            log.info(
+                f"MAKER MODE: signal {score}/3 conf={signal.confidence:.2f} "
+                f"fair_value=${fair:.2f} → bidding ${limit_price:.2f}"
+            )
+
         try:
             self._init_clob_client()
         except Exception as e:
