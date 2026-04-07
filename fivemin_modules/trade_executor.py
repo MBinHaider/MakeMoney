@@ -1,5 +1,6 @@
 import json
 import asyncio
+import time
 from datetime import datetime, timezone
 from fivemin_modules.signal_engine import Signal
 from utils.db import get_connection
@@ -184,30 +185,44 @@ class FiveMinTradeExecutor:
             order_id = resp.get("orderID", resp.get("id", str(resp)))
             log.info(f"LIVE ORDER POSTED: {order_id}")
 
-            # Wait up to 30 seconds for fill, checking every 5s
-            import time
+            # Maker mode: poll for fill, cancel if timeout
+            timeout = getattr(self.config, "FIVEMIN_MAKER_TIMEOUT_SEC", 60)
+            poll_interval = 1
+            elapsed = 0
             filled = 0
-            status = "LIVE"
-            for check in range(6):
-                time.sleep(5)
-                try:
-                    order_status = self._clob_client.get_order(order_id)
-                    filled = float(order_status.get("size_matched", 0))
-                    status = order_status.get("status", "unknown")
-                    log.info(f"LIVE CHECK {check+1}/6: status={status} filled={filled:.1f}/{shares:.1f}")
-                    if filled > 0:
-                        break
-                except Exception as e:
-                    log.warning(f"Order check failed: {e}")
+            status = "unknown"
+            order_resp = resp  # initial post_order response
 
-            # If not filled, cancel and move on
-            if filled == 0:
+            # If matched immediately, skip polling
+            if order_resp.get("status") == "matched":
+                filled = float(order_resp.get("makingAmount", shares))
+                status = "matched"
+            else:
+                while elapsed < timeout:
+                    time.sleep(poll_interval)
+                    elapsed += poll_interval
+                    try:
+                        order_status = self._clob_client.get_order(order_id)
+                        filled = float(order_status.get("size_matched", 0))
+                        status = order_status.get("status", "unknown")
+                        log.info(
+                            f"LIVE POLL [{elapsed}/{timeout}s]: "
+                            f"status={status} filled={filled:.1f}/{shares:.1f}"
+                        )
+                        if filled > 0 or status in ("MATCHED", "FILLED", "matched", "filled"):
+                            break
+                    except Exception as e:
+                        log.warning(f"Order poll error: {e}")
+                        break
+
+            # Cancel if still unfilled
+            if filled == 0 and status not in ("MATCHED", "FILLED", "matched", "filled"):
                 try:
                     self._clob_client.cancel(order_id)
-                    log.info(f"LIVE ORDER CANCELLED (unfilled after 30s): {order_id}")
-                except Exception:
-                    pass
-                return {"status": "error", "reason": "Limit order not filled in 30s"}
+                    log.info(f"Cancelled unfilled order: {order_id}")
+                except Exception as e:
+                    log.warning(f"Cancel failed: {e}")
+                return {"status": "error", "reason": "Order not filled within timeout"}
 
             actual_shares = filled
             actual_cost = actual_shares * limit_price
