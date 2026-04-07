@@ -116,3 +116,42 @@ def calc_volume_spike(volumes: list[float], price_delta: float) -> IndicatorResu
     direction = "UP" if price_delta > 0 else "DOWN"
     confidence = min(1.0, 0.4 + (spike_ratio - 2.0) / (5.0 - 2.0) * 0.6)
     return IndicatorResult(direction, round(confidence, 4))
+
+
+def _trend_at(price_history, seconds_back: int):
+    """Compute price delta over the last `seconds_back` data points.
+
+    price_history is a deque of prices sampled at ~1Hz.
+    Returns None if not enough data, otherwise (current - past).
+    """
+    if len(price_history) < seconds_back + 1:
+        return None
+    history_list = list(price_history)
+    current = history_list[-1]
+    past = history_list[-seconds_back - 1]
+    return current - past
+
+
+def trends_align(price_history, direction: str) -> bool:
+    """Check that 30s, 2m, and 5m trends all point the same direction.
+
+    price_history: deque of prices (~1 sample per second)
+    direction: "UP" or "DOWN"
+
+    Returns True only when:
+      - We have at least 301 data points (5 minutes of history)
+      - All three trends are non-zero
+      - All three trends match the requested direction
+    """
+    t30 = _trend_at(price_history, 30)
+    t2m = _trend_at(price_history, 120)
+    t5m = _trend_at(price_history, 300)
+
+    if t30 is None or t2m is None or t5m is None:
+        return False
+
+    if direction == "UP":
+        return t30 > 0 and t2m > 0 and t5m > 0
+    elif direction == "DOWN":
+        return t30 < 0 and t2m < 0 and t5m < 0
+    return False

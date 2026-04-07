@@ -110,4 +110,24 @@ class Config:
     FIVEMIN_DAILY_LOSS_LIMIT_PCT = 0.20
     FIVEMIN_DAILY_TRADE_CAP = 50
     FIVEMIN_DB_PATH = os.path.join(os.path.dirname(__file__), "data", "polybot5m.db")
+
+    # Stage 1: Confidence-scaled position sizing
+    FIVEMIN_SIZE_3OF3_HIGH = 10.0   # 3/3 indicators, conf >= 0.85
+    FIVEMIN_SIZE_3OF3_MED  = 7.0    # 3/3 indicators, conf >= 0.70
+    FIVEMIN_SIZE_2OF3_HIGH = 5.0    # 2/3 indicators, conf >= 0.75
+    FIVEMIN_SIZE_2OF3_LOW  = 3.0    # 2/3 indicators, conf >= 0.55
+
+    # Stage 1: Multi-timeframe trend confirmation
+    FIVEMIN_TREND_REQUIRE_ALIGN = True   # set False to disable check
+    FIVEMIN_TREND_LOOKBACK_30S  = 30
+    FIVEMIN_TREND_LOOKBACK_2M   = 120
+    FIVEMIN_TREND_LOOKBACK_5M   = 300
+
+    # Stage 1: Limit-order maker mode
+    FIVEMIN_MAKER_MODE_ENABLED = True
+    FIVEMIN_MAKER_TIMEOUT_SEC  = 60      # cancel unfilled orders after this
+    FIVEMIN_MAKER_FAIR_VALUE_OFFSET = 0.05  # bid this much below fair value
+    FIVEMIN_MAKER_MIN_PRICE = 0.05       # never bid below this
+    FIVEMIN_MAKER_MAX_PRICE = 0.80       # never bid above this
+
     POLYMARKET_PROXY_ADDRESS = os.getenv("POLYMARKET_PROXY_ADDRESS", "")

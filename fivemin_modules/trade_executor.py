@@ -1,5 +1,6 @@
 import json
 import asyncio
+import time
 from datetime import datetime, timezone
 from fivemin_modules.signal_engine import Signal
 from utils.db import get_connection
@@ -7,6 +8,30 @@ from utils.logger import get_logger
 from config import Config
 
 log = get_logger("fivemin_trade_executor")
+
+
+def compute_fair_value(score: int, confidence: float,
+                       min_price: float = 0.05, max_price: float = 0.80) -> float:
+    """Compute a fair-value bid price for a maker order.
+
+    Stronger signal → higher bid (more willing to pay).
+    Weaker signal → lower bid (only fill if very cheap).
+
+    Mapping:
+      3/3 indicators @ conf 0.95+ → $0.55
+      3/3 indicators @ conf 0.85  → $0.50
+      3/3 indicators @ conf 0.70  → $0.45
+      2/3 indicators @ conf 0.80  → $0.40
+      2/3 indicators @ conf 0.55  → $0.30
+    """
+    if score == 3:
+        # Linear from 0.45 (conf=0.70) to 0.60 (conf=1.0)
+        fv = 0.45 + (max(0.70, min(1.0, confidence)) - 0.70) * 0.50
+    else:  # score == 2
+        # Linear from 0.30 (conf=0.55) to 0.45 (conf=1.0)
+        fv = 0.30 + (max(0.55, min(1.0, confidence)) - 0.55) * (0.15 / 0.45)
+
+    return round(max(min_price, min(max_price, fv)), 2)
 
 
 class FiveMinTradeExecutor:
@@ -109,6 +134,28 @@ class FiveMinTradeExecutor:
             log.error("LIVE: No token ID for order")
             return {"status": "error", "reason": "No token ID"}
 
+        # Stage 1: Maker mode — replace caller's limit_price with fair value
+        if getattr(self.config, "FIVEMIN_MAKER_MODE_ENABLED", False):
+            score = sum(
+                1 for v in signal.indicators.values()
+                if isinstance(v, dict) and v.get("direction") == signal.direction
+            )
+            fair = compute_fair_value(
+                score=score,
+                confidence=signal.confidence,
+                min_price=getattr(self.config, "FIVEMIN_MAKER_MIN_PRICE", 0.05),
+                max_price=getattr(self.config, "FIVEMIN_MAKER_MAX_PRICE", 0.80),
+            )
+            offset = getattr(self.config, "FIVEMIN_MAKER_FAIR_VALUE_OFFSET", 0.05)
+            limit_price = max(
+                getattr(self.config, "FIVEMIN_MAKER_MIN_PRICE", 0.05),
+                round(fair - offset, 2),
+            )
+            log.info(
+                f"MAKER MODE: signal {score}/3 conf={signal.confidence:.2f} "
+                f"fair_value=${fair:.2f} → bidding ${limit_price:.2f}"
+            )
+
         try:
             self._init_clob_client()
         except Exception as e:
@@ -138,30 +185,44 @@ class FiveMinTradeExecutor:
             order_id = resp.get("orderID", resp.get("id", str(resp)))
             log.info(f"LIVE ORDER POSTED: {order_id}")
 
-            # Wait up to 30 seconds for fill, checking every 5s
-            import time
+            # Maker mode: poll for fill, cancel if timeout
+            timeout = getattr(self.config, "FIVEMIN_MAKER_TIMEOUT_SEC", 60)
+            poll_interval = 1
+            elapsed = 0
             filled = 0
-            status = "LIVE"
-            for check in range(6):
-                time.sleep(5)
-                try:
-                    order_status = self._clob_client.get_order(order_id)
-                    filled = float(order_status.get("size_matched", 0))
-                    status = order_status.get("status", "unknown")
-                    log.info(f"LIVE CHECK {check+1}/6: status={status} filled={filled:.1f}/{shares:.1f}")
-                    if filled > 0:
-                        break
-                except Exception as e:
-                    log.warning(f"Order check failed: {e}")
+            status = "unknown"
+            order_resp = resp  # initial post_order response
 
-            # If not filled, cancel and move on
-            if filled == 0:
+            # If matched immediately, skip polling
+            if order_resp.get("status") == "matched":
+                filled = float(order_resp.get("makingAmount", shares))
+                status = "matched"
+            else:
+                while elapsed < timeout:
+                    time.sleep(poll_interval)
+                    elapsed += poll_interval
+                    try:
+                        order_status = self._clob_client.get_order(order_id)
+                        filled = float(order_status.get("size_matched", 0))
+                        status = order_status.get("status", "unknown")
+                        log.info(
+                            f"LIVE POLL [{elapsed}/{timeout}s]: "
+                            f"status={status} filled={filled:.1f}/{shares:.1f}"
+                        )
+                        if filled > 0 or status in ("MATCHED", "FILLED", "matched", "filled"):
+                            break
+                    except Exception as e:
+                        log.warning(f"Order poll error: {e}")
+                        break
+
+            # Cancel if still unfilled
+            if filled == 0 and status not in ("MATCHED", "FILLED", "matched", "filled"):
                 try:
                     self._clob_client.cancel(order_id)
-                    log.info(f"LIVE ORDER CANCELLED (unfilled after 30s): {order_id}")
-                except Exception:
-                    pass
-                return {"status": "error", "reason": "Limit order not filled in 30s"}
+                    log.info(f"Cancelled unfilled order: {order_id}")
+                except Exception as e:
+                    log.warning(f"Cancel failed: {e}")
+                return {"status": "error", "reason": "Order not filled within timeout"}
 
             actual_shares = filled
             actual_cost = actual_shares * limit_price

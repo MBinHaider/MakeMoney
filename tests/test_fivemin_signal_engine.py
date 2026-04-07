@@ -1,4 +1,5 @@
 import pytest
+from collections import deque
 from fivemin_modules.signal_engine import FiveMinSignalEngine, Signal
 from fivemin_modules.indicators import IndicatorResult
 from config import Config
@@ -15,6 +16,7 @@ def _make_market_state(
     volumes=None,
     orderbook_up=None,
     orderbook_down=None,
+    price_history=None,
 ):
     if volumes is None:
         volumes = [10.0] * 30
@@ -28,12 +30,15 @@ def _make_market_state(
             "bids": [(0.44, 20), (0.43, 15), (0.42, 10), (0.41, 10), (0.40, 5)],
             "asks": [(0.45, 100), (0.46, 80), (0.47, 60), (0.48, 40), (0.49, 30)],
         }
+    if price_history is None:
+        price_history = deque([100.0 + i * 0.05 for i in range(350)], maxlen=350)
     return {
         "current_price": current_price,
         "window_open_price": window_open_price,
         "volumes": volumes,
         "orderbook_up": orderbook_up,
         "orderbook_down": orderbook_down,
+        "price_history": price_history,
     }
 
 

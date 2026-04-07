@@ -40,7 +40,7 @@ class MarketState:
     orderbook_up: dict = field(default_factory=lambda: {"bids": [], "asks": []})
     orderbook_down: dict = field(default_factory=lambda: {"bids": [], "asks": []})
     volumes: deque = field(default_factory=lambda: deque(maxlen=60))
-    price_history: deque = field(default_factory=lambda: deque(maxlen=60))
+    price_history: deque = field(default_factory=lambda: deque(maxlen=350))
     token_id_up: str = ""
     token_id_down: str = ""
     condition_id: str = ""
@@ -53,7 +53,7 @@ class MarketState:
         self.orderbook_up = {"bids": [], "asks": []}
         self.orderbook_down = {"bids": [], "asks": []}
         self.volumes = deque(maxlen=60)
-        self.price_history = deque(maxlen=60)
+        self.price_history = deque(maxlen=350)
         self.token_id_up = ""
         self.token_id_down = ""
         self.condition_id = ""
@@ -66,6 +66,7 @@ class MarketState:
             "volumes": list(self.volumes),
             "orderbook_up": self.orderbook_up,
             "orderbook_down": self.orderbook_down,
+            "price_history": self.price_history,
         }
 
 

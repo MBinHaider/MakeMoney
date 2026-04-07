@@ -162,10 +162,18 @@ class PolyBot5M:
                         await asyncio.sleep(1)
                         continue
 
-                # Position sizing: $5 for 3/3 agreement, $3 for 2/3
+                # Position sizing: confidence-scaled $3-$10 (Stage 1)
                 agreeing = sum(1 for v in best.indicators.values()
                                if isinstance(v, dict) and v.get("direction") == best.direction)
-                trade_amount = min(can_trade["max_amount"], 5.0 if agreeing >= 3 else 3.0)
+                trade_amount = self.risk_manager.calc_position_size_for_signal(
+                    score=agreeing,
+                    confidence=best.confidence,
+                )
+                trade_amount = min(trade_amount, can_trade["max_amount"])
+                if trade_amount <= 0:
+                    log.info(f"Skipping {best.asset} {best.direction}: signal too weak for sizing")
+                    await asyncio.sleep(1)
+                    continue
 
                 # Get token ID for live trading
                 state = self.market_data.states.get(best.asset)
