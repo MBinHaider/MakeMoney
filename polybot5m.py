@@ -39,7 +39,9 @@ class PolyBot5M:
         init_fivemin_db(self.config.FIVEMIN_DB_PATH)
         self.risk_manager.init_portfolio(self.config.FIVEMIN_STARTING_BALANCE)
 
-        # Init PMXT exchange (needed for live trading)
+        # Live trading uses py-clob-client (not PMXT). PMXT init is best-effort
+        # for market discovery only — failure does NOT block live trading.
+        self.exchange = None
         if self.config.FIVEMIN_TRADING_MODE == "live":
             try:
                 import pmxt
@@ -47,14 +49,10 @@ class PolyBot5M:
                     "privateKey": self.config.PRIVATE_KEY,
                     "proxyAddress": self.config.POLYMARKET_PROXY_ADDRESS,
                 })
-                log.info("PMXT exchange connected (LIVE MODE)")
+                log.info("PMXT exchange connected (auxiliary, LIVE MODE)")
             except Exception as e:
-                log.error(f"PMXT init failed — cannot trade live: {e}")
-                log.info("Falling back to paper mode")
-                self.config.FIVEMIN_TRADING_MODE = "paper"
-                self.exchange = None
-        else:
-            self.exchange = None
+                log.warning(f"PMXT init failed (non-fatal, py-clob-client handles trades): {e}")
+                log.info("Continuing in LIVE MODE — trades go through py-clob-client")
 
         self.executor = FiveMinTradeExecutor(self.config, self.exchange)
 
