@@ -134,56 +134,84 @@ class FiveMinMarketData:
             state.window_open_price = close
 
     async def fetch_orderbooks(self, exchange=None) -> None:
-        """Fetch orderbooks from Polymarket CLOB API.
-        Tries direct first, falls back to SOCKS5 proxy if DNS fails."""
+        """Fetch orderbooks from Polymarket CLOB API via requests + SOCKS5.
 
-        for attempt in range(3):
+        Uses synchronous `requests` library in an executor — `aiohttp_socks`
+        has known compatibility issues with Cloudflare WARP's MASQUE protocol
+        that cause Connection-reset-by-peer during SSL handshake.
+        """
+        import requests as _requests
+        loop = asyncio.get_event_loop()
+        proxies = {
+            "https": self.config.PROXY_URL,
+            "http": self.config.PROXY_URL,
+        }
+
+        def _sync_fetch_token_ids(slug: str) -> dict:
+            url = f"https://gamma-api.polymarket.com/events?slug={slug}"
             try:
-                # Try direct first
-                if attempt < 2:
-                    session_ctx = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
-                else:
-                    # Fallback to proxy on 3rd attempt
-                    from aiohttp_socks import ProxyConnector
-                    connector = ProxyConnector.from_url(self.config.PROXY_URL)
-                    session_ctx = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=10))
-
-                async with session_ctx as session:
-                    for asset in self.config.FIVEMIN_ASSETS:
-                        state = self.states.get(asset)
-                        if state is None:
-                            continue
-
-                        # Only fetch token IDs if we don't have them for this window
-                        if not state.token_id_up or not state.token_id_down:
-                            slug = compute_market_slug(asset, state.window_ts)
-                            try:
-                                token_ids = await self._fetch_token_ids(session, slug)
-                                if token_ids:
-                                    state.token_id_up = token_ids.get("UP", "")
-                                    state.token_id_down = token_ids.get("DOWN", "")
-                                    log.info(f"Got token IDs for {asset}: UP={state.token_id_up[:20]}...")
-                            except Exception as e:
-                                log.warning(f"Token ID fetch failed {asset}: {e}")
-
-                        # Fetch orderbooks if we have token IDs
-                        if state.token_id_up:
-                            try:
-                                state.orderbook_up = await self._fetch_clob_orderbook(session, state.token_id_up)
-                            except Exception:
-                                pass
-                        if state.token_id_down:
-                            try:
-                                state.orderbook_down = await self._fetch_clob_orderbook(session, state.token_id_down)
-                            except Exception:
-                                pass
-                return  # Success, no retry needed
+                r = _requests.get(url, proxies=proxies, timeout=10)
+                if r.status_code != 200:
+                    return {}
+                events = r.json()
+                if not events:
+                    return {}
+                event = events[0]
+                token_ids = {}
+                for market in event.get("markets", []):
+                    outcomes_str = market.get("outcomes", "[]")
+                    clob_str = market.get("clobTokenIds", "[]")
+                    try:
+                        outcomes = json.loads(outcomes_str) if isinstance(outcomes_str, str) else outcomes_str
+                        clob_ids = json.loads(clob_str) if isinstance(clob_str, str) else clob_str
+                        for outcome, tid in zip(outcomes, clob_ids):
+                            label = outcome.upper()
+                            if label in ("UP", "YES"):
+                                token_ids["UP"] = tid
+                            elif label in ("DOWN", "NO"):
+                                token_ids["DOWN"] = tid
+                    except Exception:
+                        pass
+                return token_ids
             except Exception as e:
-                if attempt < 2:
-                    log.warning(f"Proxy attempt {attempt+1}/3 failed, retrying in 2s...")
-                    await asyncio.sleep(2)
-                else:
-                    log.error(f"Proxy connection failed after 3 attempts: {e}")
+                log.warning(f"Gamma API error for {slug}: {e}")
+                return {}
+
+        def _sync_fetch_orderbook(token_id: str) -> dict:
+            url = f"https://clob.polymarket.com/book?token_id={token_id}"
+            try:
+                r = _requests.get(url, proxies=proxies, timeout=10)
+                if r.status_code != 200:
+                    return {"bids": [], "asks": []}
+                book = r.json()
+                bids = [(float(b["price"]), float(b["size"])) for b in book.get("bids", [])]
+                asks = [(float(a["price"]), float(a["size"])) for a in book.get("asks", [])]
+                return {"bids": bids, "asks": asks}
+            except Exception as e:
+                log.warning(f"Orderbook error for {token_id[:20]}: {e}")
+                return {"bids": [], "asks": []}
+
+        def _sync_fetch_all():
+            for asset in self.config.FIVEMIN_ASSETS:
+                state = self.states.get(asset)
+                if state is None:
+                    continue
+                if not state.token_id_up or not state.token_id_down:
+                    slug = compute_market_slug(asset, state.window_ts)
+                    token_ids = _sync_fetch_token_ids(slug)
+                    if token_ids:
+                        state.token_id_up = token_ids.get("UP", "")
+                        state.token_id_down = token_ids.get("DOWN", "")
+                        log.info(f"Got token IDs for {asset}: UP={state.token_id_up[:20]}...")
+                if state.token_id_up:
+                    state.orderbook_up = _sync_fetch_orderbook(state.token_id_up)
+                if state.token_id_down:
+                    state.orderbook_down = _sync_fetch_orderbook(state.token_id_down)
+
+        try:
+            await loop.run_in_executor(None, _sync_fetch_all)
+        except Exception as e:
+            log.error(f"fetch_orderbooks error: {e}")
 
     async def _fetch_token_ids(self, session: aiohttp.ClientSession, slug: str) -> dict:
         """Fetch UP/DOWN token IDs from Gamma API for a market slug."""
