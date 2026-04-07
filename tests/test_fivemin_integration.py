@@ -1,5 +1,6 @@
 import os
 import tempfile
+from collections import deque
 import pytest
 from config import Config
 from utils.fivemin_db import init_fivemin_db
@@ -45,6 +46,7 @@ class TestFullTradeFlow:
                 "bids": [(0.44, 20), (0.43, 15), (0.42, 10), (0.41, 10), (0.40, 5)],
                 "asks": [(0.45, 100), (0.46, 80), (0.47, 60), (0.48, 40), (0.49, 30)],
             },
+            "price_history": deque([100.0 + i * 0.05 for i in range(350)], maxlen=350),
         }
 
         # Evaluate signal (early phase, need all 3)
@@ -92,6 +94,7 @@ class TestFullTradeFlow:
                 "bids": [(0.44, 20), (0.43, 15), (0.42, 10), (0.41, 10), (0.40, 5)],
                 "asks": [(0.45, 100), (0.46, 80), (0.47, 60), (0.48, 40), (0.49, 30)],
             },
+            "price_history": deque([100.0 + i * 0.05 for i in range(350)], maxlen=350),
         }
 
         # 3 small losses trigger cooldown (use $1 trades to stay under daily loss limit)

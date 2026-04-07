@@ -3,6 +3,7 @@ from fivemin_modules.indicators import (
     calc_momentum,
     calc_orderbook_imbalance,
     calc_volume_spike,
+    trends_align,
     IndicatorResult,
 )
 from utils.logger import get_logger
@@ -66,6 +67,15 @@ class FiveMinSignalEngine:
             if len(agreeing) >= min_agree:
                 avg_confidence = sum(r.confidence for r in agreeing) / len(agreeing)
                 if avg_confidence >= min_confidence:
+                    # Multi-timeframe trend confirmation (Stage 1)
+                    if getattr(self.config, "FIVEMIN_TREND_REQUIRE_ALIGN", False):
+                        history = state.get("price_history")
+                        if history is None or not trends_align(history, direction):
+                            log.info(
+                                f"{asset} {direction} signal blocked: trends not aligned "
+                                f"({len(agreeing)}/3 agree, conf={avg_confidence:.2f})"
+                            )
+                            continue
                     log.info(
                         f"{asset} {direction} signal: {len(agreeing)}/3 agree, "
                         f"confidence={avg_confidence:.2f}, phase={phase}"
