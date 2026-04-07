@@ -115,6 +115,28 @@ class FiveMinRiskManager:
         conn.close()
         log.info(f"Trade outcome: PnL=${pnl:.2f} | Balance=${new_balance:.2f}")
 
+    def calc_position_size_for_signal(self, score: int, confidence: float) -> float:
+        """Confidence-scaled position sizing.
+
+        Replaces flat $3 with dynamic $3-$10 based on signal strength.
+        Returns 0 if signal is too weak to trade.
+        Capped by current balance.
+        """
+        if score == 3 and confidence >= 0.85:
+            size = self.config.FIVEMIN_SIZE_3OF3_HIGH
+        elif score == 3 and confidence >= 0.70:
+            size = self.config.FIVEMIN_SIZE_3OF3_MED
+        elif score == 2 and confidence >= 0.75:
+            size = self.config.FIVEMIN_SIZE_2OF3_HIGH
+        elif score == 2 and confidence >= 0.55:
+            size = self.config.FIVEMIN_SIZE_2OF3_LOW
+        else:
+            return 0.0
+
+        # Cap by current balance
+        balance = self._get_portfolio()["balance"]
+        return min(size, balance)
+
     def _set_pause(self, until: datetime) -> None:
         conn = get_connection(self.db_path)
         conn.execute(
