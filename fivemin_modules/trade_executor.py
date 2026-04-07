@@ -9,6 +9,30 @@ from config import Config
 log = get_logger("fivemin_trade_executor")
 
 
+def compute_fair_value(score: int, confidence: float,
+                       min_price: float = 0.05, max_price: float = 0.80) -> float:
+    """Compute a fair-value bid price for a maker order.
+
+    Stronger signal → higher bid (more willing to pay).
+    Weaker signal → lower bid (only fill if very cheap).
+
+    Mapping:
+      3/3 indicators @ conf 0.95+ → $0.55
+      3/3 indicators @ conf 0.85  → $0.50
+      3/3 indicators @ conf 0.70  → $0.45
+      2/3 indicators @ conf 0.80  → $0.40
+      2/3 indicators @ conf 0.55  → $0.30
+    """
+    if score == 3:
+        # Linear from 0.45 (conf=0.70) to 0.60 (conf=1.0)
+        fv = 0.45 + (max(0.70, min(1.0, confidence)) - 0.70) * 0.50
+    else:  # score == 2
+        # Linear from 0.30 (conf=0.55) to 0.45 (conf=1.0)
+        fv = 0.30 + (max(0.55, min(1.0, confidence)) - 0.55) * (0.15 / 0.45)
+
+    return round(max(min_price, min(max_price, fv)), 2)
+
+
 class FiveMinTradeExecutor:
     def __init__(self, config: Config, exchange=None):
         self.config = config
